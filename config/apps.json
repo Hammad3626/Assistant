@@ -1,0 +1,10 @@
+{
+  "apps": {
+    "airxonix": "E:\\AirXonix\\AirXonix.exe",
+    "calc": "calc.exe",
+    "calculator": "calc.exe",
+    "chrome": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "notepad": "notepad.exe",
+    "paint": "mspaint.exe"
+  }
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-pc-assistant"
+version = "0.1.0"
+description = "Offline-first local AI assistant for Windows PCs."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+voice = [
+    "sounddevice",
+    "vosk",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["assistant*"]

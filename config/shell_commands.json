@@ -1,0 +1,49 @@
+{
+  "commands": {
+    "ollama version": [
+      "ollama",
+      "--version"
+    ],
+    "pip version": [
+      "python",
+      "-m",
+      "pip",
+      "--version"
+    ],
+    "python check": [
+      "python",
+      "--version"
+    ],
+    "python version": [
+      "python",
+      "--version"
+    ]
+  },
+  "reviews": [
+    {
+      "schema": "safe_shell_review_v1",
+      "created_at": "2026-07-06T14:28:01Z",
+      "action": "add",
+      "command_name": "python check",
+      "argv": [
+        "python",
+        "--version"
+      ],
+      "static_risk": {
+        "level": "low",
+        "score": 1,
+        "reasons": [
+          "Command passed the safe argv validator.",
+          "Version-style diagnostic commands are usually low risk."
+        ]
+      },
+      "review_notes": [
+        "Allowlist edit only; command was not run.",
+        "Command argv passed safe shell validation.",
+        "Static risk score: low (1/10).",
+        "Running this command still requires explicit confirmation."
+      ],
+      "review_signature": "79c1136f4b83e7a7954c3df6594c7df9f6941ec687c1ec8a940d797d615fad12"
+    }
+  ]
+}

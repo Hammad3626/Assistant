@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: local-pc-assistant
+Version: 0.1.0
+Summary: Offline-first local AI assistant for Windows PCs.
+Requires-Python: >=3.11
+Provides-Extra: voice
+Requires-Dist: sounddevice; extra == "voice"
+Requires-Dist: vosk; extra == "voice"

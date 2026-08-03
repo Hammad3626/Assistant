@@ -1,0 +1,9 @@
+{
+  "aliases": {
+    "memory please": "memories",
+    "recent conversation": "history",
+    "show action log": "action audit",
+    "show me what you know": "memories",
+    "show saved memories": "memories"
+  }
+}
