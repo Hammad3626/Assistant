@@ -349,6 +349,117 @@ class GuiTests(unittest.TestCase):
         mock_dashboard.assert_called_once()
         mock_append.assert_called_once_with("Startup dashboard")
 
+    def test_set_pending_buttons_enables_confirmation_when_true(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.confirm_button = Mock()
+        gui.cancel_button = Mock()
+
+        gui._set_pending_buttons(True)
+
+        gui.confirm_button.configure.assert_called_with(state="normal")
+        gui.cancel_button.configure.assert_called_with(state="normal")
+
+    def test_set_pending_buttons_disables_confirmation_when_false(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.confirm_button = Mock()
+        gui.cancel_button = Mock()
+
+        gui._set_pending_buttons(False)
+
+        gui.confirm_button.configure.assert_called_with(state="disabled")
+        gui.cancel_button.configure.assert_called_with(state="disabled")
+
+    def test_append_assistant_adds_line_to_transcript(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.transcript = Mock()
+
+        gui._append_assistant("Hello, how can I help?")
+
+        gui.transcript.configure.assert_any_call(state="normal")
+        gui.transcript.insert.assert_called()
+        gui.transcript.configure.assert_any_call(state="disabled")
+        gui.transcript.see.assert_called_once()
+
+    def test_append_user_adds_formatted_line_to_transcript(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.transcript = Mock()
+
+        gui._append_user("Hello assistant")
+
+        gui.transcript.configure.assert_any_call(state="normal")
+        gui.transcript.insert.assert_called()
+        gui.transcript.configure.assert_any_call(state="disabled")
+
+    def test_cancel_action_clears_pending_state(self) -> None:
+        gui = object.__new__(AssistantGui)
+        action = Mock()
+        gui.pending_action = action
+        gui.assistant = Mock()
+        gui.assistant.action_audit_store = Mock()
+        gui._set_pending_buttons = Mock()
+        gui._append_assistant = Mock()
+
+        gui._cancel_action()
+
+        self.assertIsNone(gui.pending_action)
+        gui._set_pending_buttons.assert_called_once_with(False)
+        gui._append_assistant.assert_called_once()
+
+    def test_send_ignores_empty_input(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.input_var = Mock()
+        gui.input_var.get.return_value = ""
+        gui.assistant = Mock()
+
+        gui._send()
+
+        gui.assistant.respond.assert_not_called()
+
+    def test_execute_action_handles_background_execution(self) -> None:
+        gui = object.__new__(AssistantGui)
+        gui.assistant = Mock()
+        gui.assistant.confirm_pending_action.return_value = "Action completed"
+        gui.queue = Mock()
+        gui._append_assistant = Mock()
+        action = Mock()
+
+        gui._execute_action_in_background("yes", action)
+
+        gui.assistant.confirm_pending_action.assert_called_once()
+
+    def test_menu_builtin_commands_includes_essential_operations(self) -> None:
+        commands = AssistantGui._menu_builtin_commands()
+
+        self.assertIn("briefing", commands)
+        self.assertIn("settings", commands)
+        self.assertIn("safety", commands)
+        self.assertIn("memories", commands)
+        self.assertIn("tasks", commands)
+        self.assertIn("command reference", commands)
+
+    def test_gui_has_toolbar_methods(self) -> None:
+        # Verify toolbar method names exist
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_list_files"))
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_search_files"))
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_find_file_names"))
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_preview_file"))
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_verify_bulk_write_checklist"))
+        self.assertTrue(hasattr(AssistantGui, "_toolbar_verify_bulk_restore_checklist"))
+
+    def test_gui_has_voice_methods(self) -> None:
+        # Verify voice command methods exist
+        self.assertTrue(hasattr(AssistantGui, "_voice_launch_help_text"))
+        self.assertTrue(hasattr(AssistantGui, "_voice_action_review_text"))
+        self.assertTrue(hasattr(AssistantGui, "_show_voice_launch_help"))
+        self.assertTrue(hasattr(AssistantGui, "_copy_wake_launch_command"))
+
+    def test_gui_safety_snapshot_methods_exist(self) -> None:
+        # Verify all safety snapshot methods are wired
+        self.assertTrue(hasattr(AssistantGui, "_show_safety_snapshot"))
+        self.assertTrue(hasattr(AssistantGui, "_show_launch_safety_snapshot"))
+        self.assertTrue(hasattr(AssistantGui, "_show_shell_safety_snapshot"))
+        self.assertTrue(hasattr(AssistantGui, "_show_script_safety_snapshot"))
+
 
 if __name__ == "__main__":
     unittest.main()
