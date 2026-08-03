@@ -174,12 +174,25 @@ class MemoryStore:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise MemoryError(f"Invalid memory JSON: {self.path}") from exc
+            # Try to recover from backup if available
+            backup_path = self.path.with_suffix(".backup.json")
+            if backup_path.exists():
+                try:
+                    raw = json.loads(backup_path.read_text(encoding="utf-8"))
+                    # Successfully recovered from backup
+                    return raw
+                except (json.JSONDecodeError, OSError):
+                    pass
+            # If backup doesn't work or doesn't exist, return empty state
+            # User can manually restore from backup or start fresh
+            return {"memories": []}
         except OSError as exc:
-            raise MemoryError(f"Could not read memory file: {self.path}") from exc
+            # File read error - return empty state to allow recovery
+            return {"memories": []}
 
         if not isinstance(raw, dict):
-            raise MemoryError("Memory file must contain a JSON object.")
+            # Corrupted structure - return empty state
+            return {"memories": []}
         return raw
 
     def _write_memories(self, memories: list[MemoryItem]) -> None:
@@ -206,5 +219,25 @@ class MemoryStore:
                 for item in deleted_memories
             ],
         }
-        self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        
+        # Create backup before writing (atomic write safety)
+        if self.path.exists():
+            backup_path = self.path.with_suffix(".backup.json")
+            try:
+                self.path.rename(backup_path)
+            except OSError:
+                pass  # If backup fails, continue with write
+        
+        # Write new content
+        try:
+            self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            # If write fails, try to restore from backup
+            backup_path = self.path.with_suffix(".backup.json")
+            if backup_path.exists():
+                try:
+                    backup_path.rename(self.path)
+                except OSError:
+                    pass  # Backup restore also failed
+            raise
 

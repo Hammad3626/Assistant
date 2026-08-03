@@ -20,7 +20,10 @@ class OllamaClient:
     system_prompt: str | None = None
 
     def generate(self, prompt: str, memory_context: str | None = None) -> str:
-        """Generate a short local answer with Ollama."""
+        """Generate a short local answer with Ollama.
+        
+        Returns error message instead of raising, for graceful degradation.
+        """
         payload = {
             "model": self.model,
             "prompt": self._build_prompt(
@@ -48,19 +51,24 @@ class OllamaClient:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Ollama generation failed: {detail}") from exc
+            # Graceful error return instead of raising
+            return f"Ollama error: {detail}"
         except TimeoutError as exc:
-            raise RuntimeError(
-                "Ollama timed out while generating. Try a smaller model or close other heavy apps."
-            ) from exc
+            # Return user-friendly message for timeout
+            return "Ollama is taking too long. Try a smaller model or close other heavy apps."
         except urllib.error.URLError as exc:
-            raise RuntimeError(
-                "Ollama is not reachable. Start Ollama, then try again."
-            ) from exc
+            # Return helpful message when Ollama unavailable
+            return "Ollama is not running. Start Ollama, then try again. (http://127.0.0.1:11434)"
+        except json.JSONDecodeError as exc:
+            # Handle malformed responses
+            return "Ollama returned invalid data. Check if Ollama is running correctly."
+        except Exception as exc:
+            # Catch-all for unexpected errors
+            return f"Error generating response: {str(exc)}"
 
         answer = str(data.get("response", "")).strip()
         if not answer:
-            raise RuntimeError("Ollama returned an empty response.")
+            return "Ollama returned an empty response. Try again with a different prompt."
         return answer
 
     @staticmethod

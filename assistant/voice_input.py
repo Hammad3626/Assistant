@@ -309,10 +309,16 @@ def listen_once_with_confidence(config: VoiceInputConfig | None = None) -> Voice
                         speech_started_at = now
                     last_speech_at = now
 
-                if recognizer.AcceptWaveform(data):
-                    phrase_result = result_from_json(json.loads(recognizer.Result()))
-                    if phrase_result.text:
-                        return phrase_result
+                # Wrap recognizer calls in defensive error handling
+                try:
+                    if recognizer.AcceptWaveform(data):
+                        phrase_result = result_from_json(json.loads(recognizer.Result()))
+                        if phrase_result.text:
+                            return phrase_result
+                except (json.JSONDecodeError, ValueError, RuntimeError) as exc:
+                    # Skip corrupted audio chunks, don't crash
+                    audio_statuses.append(f"Recognizer error (recovered): {type(exc).__name__}")
+                    continue
 
                 if (
                     speech_started_at is not None
@@ -320,13 +326,22 @@ def listen_once_with_confidence(config: VoiceInputConfig | None = None) -> Voice
                     and (now - last_speech_at) >= silence_timeout_seconds
                     and (last_speech_at - speech_started_at) >= min_speech_seconds
                 ):
-                    final_after_silence = result_from_json(json.loads(recognizer.FinalResult()))
-                    if final_after_silence.text:
-                        return final_after_silence
+                    try:
+                        final_after_silence = result_from_json(json.loads(recognizer.FinalResult()))
+                        if final_after_silence.text:
+                            return final_after_silence
+                    except (json.JSONDecodeError, ValueError, RuntimeError) as exc:
+                        # Log error but continue
+                        audio_statuses.append(f"Final result error (recovered): {type(exc).__name__}")
     except Exception as exc:
         raise VoiceInputError(f"Microphone input failed: {exc}") from exc
 
-    final = result_from_json(json.loads(recognizer.FinalResult()))
+    # Final result with error recovery
+    try:
+        final = result_from_json(json.loads(recognizer.FinalResult()))
+    except (json.JSONDecodeError, ValueError, RuntimeError) as exc:
+        raise VoiceInputError(f"Failed to process final result: {exc}") from exc
+    
     if not final.text:
         if speech_started_at is not None:
             raise VoiceInputError("Speech detected, but transcription was empty. Check microphone level and background noise.")
