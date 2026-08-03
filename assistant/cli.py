@@ -11,6 +11,7 @@ from pathlib import Path
 from assistant.actions import ActionError, PendingAction, parse_action
 from assistant.audit import ActionAuditStore
 from assistant.aliases import AliasError, resolve_alias
+from assistant.autostart_manager import AutoStartManager
 from assistant.core import LocalAssistant
 from assistant.history import HistoryStore
 from assistant.intent_parser import normalize_intent
@@ -20,6 +21,7 @@ from assistant.ollama_client import OllamaClient
 from assistant.outbox import OutboxStore
 from assistant.persona import PersonaError, build_system_prompt, load_persona
 from assistant.settings import SettingsError, load_settings
+from assistant.startup_briefing import StartupBriefing, StartupBriefingConfig
 from assistant.tasks import TasksStore
 from assistant.voice_output import VoiceOutputConfig, VoiceOutputError, speak
 from assistant.voice_audit import VoiceActionAuditStore
@@ -293,6 +295,10 @@ def main() -> int:
     parser.add_argument("--speak", action="store_true")
     parser.add_argument("--speech-rate", type=int, default=None)
     parser.add_argument("--speech-volume", type=int, default=None)
+    parser.add_argument("--startup-briefing", action="store_true", help="Enable startup briefing on first run of the day")
+    parser.add_argument("--check-autostart", action="store_true", help="Check and report auto-start status")
+    parser.add_argument("--enable-autostart", action="store_true", help="Enable auto-start (CLI mode)")
+    parser.add_argument("--disable-autostart", action="store_true", help="Disable auto-start")
     args = parser.parse_args()
 
     try:
@@ -373,6 +379,57 @@ def main() -> int:
         print("Voice output: enabled")
     if wake_enabled:
         print("Wake mode ignores speech until the wake phrase is heard. Press Ctrl+C to stop.")
+
+    # Handle auto-start management commands
+    if args.check_autostart:
+        AutoStartManager.print_status()
+        return 0
+    
+    if args.enable_autostart:
+        result = AutoStartManager.enable_autostart(cli=True, project_root=None)
+        if result["success"]:
+            print(f"✓ Auto-start enabled for: {', '.join(result['enabled_modes'])}")
+            AutoStartManager.print_status()
+        else:
+            print(f"✗ Failed to enable auto-start: {'; '.join(result['errors'])}")
+        return 0
+    
+    if args.disable_autostart:
+        result = AutoStartManager.disable_autostart(all_modes=True)
+        if result["success"]:
+            print(f"✓ Auto-start disabled for: {', '.join(result['disabled_modes'])}")
+            AutoStartManager.print_status()
+        else:
+            print(f"✗ Failed to disable auto-start: {'; '.join(result['errors'])}")
+        return 0
+
+    # Deliver startup briefing if enabled and first run of the day
+    if args.startup_briefing or settings.startup_briefing_enabled:
+        startup_record = Path.home() / ".jarvis" / "startup_record.json"
+        
+        if StartupBriefing.is_first_startup_today(startup_record):
+            briefing = StartupBriefing(enable_voice=speak_enabled)
+            tasks_file = Path(settings.tasks_path) if settings.tasks_path else None
+            
+            result = briefing.deliver_briefing(
+                include_greeting=True,
+                include_time=True,
+                include_tasks=True,
+                include_status=True,
+                tasks_path=tasks_file,
+                ollama_available=use_llm,
+            )
+            
+            if result["success"]:
+                if speak_enabled:
+                    print(f"Assistant> {result['text']}")
+                else:
+                    print(f"\n{result['text']}\n")
+            elif result["error"]:
+                print(f"Briefing error: {result['error']}")
+            
+            # Record this startup
+            StartupBriefing.record_startup(startup_record)
 
     pending_action: PendingAction | None = None
     pending_action_needs_second_voice_confirmation = False

@@ -43,6 +43,7 @@ class AssistantSettings:
     voice_action_audit_path: str = "data/voice_action_audit.jsonl"
     persona_path: str = "config/persona.txt"
     aliases_path: str = "config/aliases.json"
+    startup_briefing_enabled: bool = True
 
     def summary(self) -> str:
         return (
@@ -70,7 +71,8 @@ class AssistantSettings:
             f"voice_action_audit_enabled={self.voice_action_audit_enabled}, "
             f"voice_action_audit_path={self.voice_action_audit_path}, "
             f"persona_path={self.persona_path}, "
-            f"aliases_path={self.aliases_path}"
+            f"aliases_path={self.aliases_path}, "
+            f"startup_briefing_enabled={self.startup_briefing_enabled}"
         )
 
 
@@ -101,6 +103,7 @@ SETTING_TYPES = {
     "voice_action_audit_path": str,
     "persona_path": str,
     "aliases_path": str,
+    "startup_briefing_enabled": bool,
 }
 
 
