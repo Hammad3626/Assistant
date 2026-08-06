@@ -55,6 +55,9 @@ from assistant.safety_snapshot import safety_snapshot_text
 from assistant.safety_reviews import SafetyReviewExportError, export_safety_reviews, safety_review_export_summary
 from assistant.search import LocalSearch, LocalSearchError
 from assistant.settings import AssistantSettings
+from assistant.system_index import IndexedItem, SystemIndex
+from assistant.index_store import IndexStore, PreferencesStore
+from assistant.system_search import SystemSearch
 from assistant.script_allowlist_design import script_allowlist_design_text
 from assistant.shell_tools import (
     DEFAULT_SHELL_COMMANDS_PATH,
@@ -152,6 +155,34 @@ class LocalAssistant:
         self.settings_path = settings_path
         self.persona_path = persona_path
         self.shell_command_wizard_active = False
+        
+        # System indexing (lazy loaded)
+        self.system_index: SystemIndex | None = None
+        self.system_search: SystemSearch | None = None
+        self.preferences_store: PreferencesStore | None = None
+        self.index_store: IndexStore | None = None
+        
+        # Pending search result for execution when user confirms
+        self.pending_search_item: IndexedItem | None = None
+        self.pending_search_query: str | None = None
+
+    def _build_system_index_text(self) -> str:
+        """Build or rebuild the system index."""
+        try:
+            from assistant.index_builder import IndexBuilder
+            builder = IndexBuilder()
+            return builder.build_index_interactive()
+        except Exception as exc:
+            return f"Index build failed: {exc}. Make sure system indexing is enabled in settings."
+
+    def _system_index_stats_text(self) -> str:
+        """Get statistics about the current system index."""
+        try:
+            from assistant.index_builder import IndexBuilder
+            builder = IndexBuilder()
+            return builder.get_index_stats()
+        except Exception as exc:
+            return f"Index stats failed: {exc}. Try running 'scan system' first."
 
     def respond(self, user_text: str) -> AssistantResponse:
         """Return a response for one user message."""
@@ -178,6 +209,36 @@ class LocalAssistant:
 
         if normalized in {"exit", "quit", "bye"}:
             return AssistantResponse("Goodbye.", should_exit=True)
+
+        # Handle confirmation of pending search result
+        if normalized == "yes" and self.pending_search_item is not None:
+            full_path = str(self.pending_search_item.full_path)
+            query = self.pending_search_query or "unknown item"
+            
+            try:
+                action = PendingAction(
+                    kind="unrestricted",
+                    target=full_path,
+                    description=f"Open: {self.pending_search_item.name}",
+                )
+                result = execute_action(action)
+                
+                # Record access if successful
+                if self.preferences_store is not None and "Action failed" not in result:
+                    try:
+                        self.preferences_store.record_access(self.pending_search_item.id)
+                    except Exception:
+                        pass  # Silently fail if recording access fails
+                
+                # Clear pending search
+                self.pending_search_item = None
+                self.pending_search_query = None
+                
+                return AssistantResponse(result)
+            except Exception as e:
+                self.pending_search_item = None
+                self.pending_search_query = None
+                return AssistantResponse(f"Error opening item: {e}")
 
         if normalized in {"help", "commands", "what can you do"}:
             return AssistantResponse(self._help_text())
@@ -416,6 +477,12 @@ class LocalAssistant:
 
         if normalized in {"wake status", "wake voice", "wake mode"}:
             return AssistantResponse(wake_status_text())
+
+        if normalized in {"scan system", "build index", "index system"}:
+            return AssistantResponse(self._build_system_index_text())
+
+        if normalized in {"index stats", "index status", "system index status"}:
+            return AssistantResponse(self._system_index_stats_text())
 
         if normalized in {"paths", "file paths", "data paths", "where is my data"}:
             return AssistantResponse(self._paths_text())
@@ -715,6 +782,20 @@ class LocalAssistant:
             )
 
         if self._looks_like_unlisted_launch_request(normalized):
+            # Allow unrestricted launches if setting is enabled
+            try:
+                from assistant.settings import load_settings
+                settings = load_settings(self.settings_path)
+                if settings.allow_unrestricted_launch:
+                    unrestricted_action = self._parse_unrestricted_launch(normalized)
+                    if unrestricted_action:
+                        return AssistantResponse(
+                            f"Please confirm: {unrestricted_action.description}. Type 'yes' to continue.",
+                            pending_action=unrestricted_action,
+                        )
+            except Exception:
+                pass  # Fall through to blocked message if settings load fails
+            
             return AssistantResponse(blocked_unlisted_launch_text())
 
         suggestions = suggest_commands(user_text)
@@ -723,6 +804,13 @@ class LocalAssistant:
 
         if self.use_llm:
             return self._respond_with_llm(user_text.strip())
+
+        # Try system indexing search as fallback for natural language file/folder/app queries
+        # Only attempt search for simple natural language-like queries (not structured commands)
+        if self._looks_like_search_query(normalized):
+            search_text, pending_action = self._search_and_open_system_item(user_text)
+            if not search_text.startswith("Unknown command"):
+                return AssistantResponse(search_text, pending_action=pending_action)
 
         return AssistantResponse(unknown_command_text(user_text))
 
@@ -833,6 +921,50 @@ class LocalAssistant:
             "Aliases are local shortcuts loaded from config/aliases.json."
         )
 
+    def _parse_unrestricted_launch(self, normalized: str) -> PendingAction | None:
+        """Parse unrestricted launch request and return action for user confirmation."""
+        # Remove launch prefixes and get the target
+        # Order matters: longer prefixes should come before shorter ones to match correctly
+        prefixes = [
+            "open file ",
+            "open folder ",
+            "open document ",
+            "run script ",
+            "run unlisted ",
+            "open ",
+            "launch ",
+            "start ",
+            "run ",
+            "execute ",
+        ]
+        
+        target = None
+        for prefix in prefixes:
+            if normalized.startswith(prefix):
+                target = normalized[len(prefix):].strip()
+                break
+        
+        if not target:
+            return None
+        
+        # Create action description based on target type
+        if target.endswith(('.exe', '.bat', '.cmd', '.com', '.ps1')):
+            description = f"Launch application: {target}"
+        elif any(target.endswith(ext) for ext in ['.txt', '.pdf', '.doc', '.docx', '.xlsx', '.csv', '.json']):
+            description = f"Open file: {target}"
+        elif target in {'my pc', 'this pc', 'my computer', 'file explorer'}:
+            description = f"Open file explorer"
+        elif target.lower() in {'settings', 'windows settings'}:
+            description = f"Open Windows settings"
+        else:
+            description = f"Open: {target}"
+        
+        return PendingAction(
+            kind="unrestricted",
+            target=target,
+            description=description,
+        )
+
     @staticmethod
     def _looks_like_unlisted_launch_request(normalized: str) -> bool:
         return normalized.startswith(
@@ -845,6 +977,7 @@ class LocalAssistant:
                 "open document ",
                 "run script ",
                 "run unlisted ",
+                "run ",
                 "execute ",
             )
         )
@@ -2272,6 +2405,98 @@ class LocalAssistant:
             )
 
         return AssistantResponse(answer)
+
+    def _looks_like_search_query(self, normalized: str) -> bool:
+        """Check if the normalized query looks like a natural language search for files/folders/apps."""
+        # Exclude structured commands with colons, slashes, special chars
+        if ":" in normalized or "//" in normalized or " and " in normalized:
+            return False
+        
+        # Exclude very short queries (likely not file/folder searches)
+        if len(normalized) < 3:
+            return False
+        
+        # Exclude queries with numbers followed by colons (likely commands like "python 3:")
+        if any(char.isdigit() for char in normalized[:5]) and ":" in normalized:
+            return False
+        
+        # Exclude queries with multiple spaces followed by colons
+        if normalized.count(" ") > 2 and ":" in normalized:
+            return False
+        
+        return True
+
+    def _init_system_indexing(self) -> bool:
+        """Initialize system indexing if not already done. Returns True if successful and enabled."""
+        try:
+            from assistant.settings import load_settings
+            settings = load_settings(self.settings_path)
+        except Exception:
+            return False
+
+        if not settings.system_indexing_enabled:
+            return False
+
+        if self.system_index is not None:
+            return True  # Already initialized
+
+        try:
+            self.index_store = IndexStore(Path(settings.system_index_path))
+            self.system_index = self.index_store.load_index()
+            self.preferences_store = PreferencesStore(Path(settings.system_index_preferences_path))
+            self.system_search = SystemSearch(self.system_index)
+            return True
+        except Exception:
+            return False
+
+    def _search_and_open_system_item(self, query: str) -> tuple[str, PendingAction | None]:
+        """Search index for item matching query. Returns (text_response, pending_action)."""
+        if not self._init_system_indexing():
+            return unknown_command_text(query), None
+
+        if self.system_search is None:
+            return unknown_command_text(query), None
+
+        try:
+            matches = self.system_search.search(query.strip(), limit=5)
+        except Exception:
+            return unknown_command_text(query), None
+
+        if not matches:
+            return f"No items found matching '{query}'. Try being more specific.", None
+
+        # Single match: offer to open with pending action
+        if len(matches) == 1:
+            match = matches[0]
+            confidence = f"{match.score:.0%}"
+            
+            # Store for potential execution
+            self.pending_search_item = match.item
+            self.pending_search_query = query
+            
+            # Create pending action for unrestricted launch
+            action = PendingAction(
+                kind="unrestricted",
+                target=str(match.item.full_path),
+                description=f"Open: {match.item.name}",
+            )
+            
+            return (
+                f"Found '{match.item.name}' ({confidence} match). "
+                f"Would you like me to open it? (Reply 'yes')",
+                action,
+            )
+
+        # Multiple matches: present options (no pending action yet)
+        options_text = "\n".join(
+            f"  {i+1}. {match.item.name} ({match.item.item_type}) - {match.score:.0%} match"
+            for i, match in enumerate(matches)
+        )
+        return (
+            f"I found {len(matches)} matching items:\n{options_text}\n"
+            "Which one would you like to open? (Reply with the number)",
+            None,
+        )
 
 
 def _parse_voice_audit_filters(command_text: str) -> tuple[str | None, str | None]:

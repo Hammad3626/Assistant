@@ -157,6 +157,62 @@ class ActionTests(unittest.TestCase):
         mock_startfile.assert_called_once_with("shell:MyComputerFolder")
         self.assertIn("Done", result)
 
+    @patch("assistant.actions.os.startfile", create=True)
+    def test_try_open_unrestricted_file(self, mock_startfile) -> None:
+        """Test opening an arbitrary file via try_open_unrestricted."""
+        from assistant.actions import try_open_unrestricted
+        
+        result = try_open_unrestricted("C:\\Users\\test\\document.pdf")
+        
+        mock_startfile.assert_called_once_with("C:\\Users\\test\\document.pdf")
+        self.assertIn("Done", result)
+
+    @patch("assistant.actions.os.startfile", create=True)
+    def test_try_open_unrestricted_folder(self, mock_startfile) -> None:
+        """Test opening an arbitrary folder via try_open_unrestricted."""
+        from assistant.actions import try_open_unrestricted
+        
+        result = try_open_unrestricted("D:\\Projects")
+        
+        mock_startfile.assert_called_once()
+        self.assertIn("Done", result)
+
+    @patch("assistant.actions.subprocess.Popen")
+    @patch("assistant.actions.os.startfile", side_effect=OSError("Not a file"))
+    def test_try_open_unrestricted_app_fallback(self, mock_startfile, mock_popen) -> None:
+        """Test opening an app when startfile fails."""
+        from assistant.actions import try_open_unrestricted
+        
+        result = try_open_unrestricted("notepad.exe")
+        
+        mock_startfile.assert_called_once()
+        mock_popen.assert_called_once_with(["notepad.exe"])
+        self.assertIn("Done", result)
+
+    def test_try_open_unrestricted_rejects_shell_commands(self) -> None:
+        """Test that try_open_unrestricted rejects shell control characters."""
+        from assistant.actions import try_open_unrestricted, ActionError
+        
+        with self.assertRaises(ActionError) as context:
+            try_open_unrestricted("file.txt | delete")
+        
+        self.assertIn("shell control", str(context.exception))
+
+    @patch("assistant.actions.os.startfile", create=True)
+    def test_execute_unrestricted_action(self, mock_startfile) -> None:
+        """Test executing an unrestricted action."""
+        from assistant.actions import PendingAction
+        
+        action = PendingAction(
+            kind="unrestricted",
+            target="C:\\test\\file.txt",
+            description="Open test file",
+        )
+        
+        result = execute_action(action)
+        
+        self.assertIn("Done", result)
+
 
 if __name__ == "__main__":
     unittest.main()

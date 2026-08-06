@@ -199,6 +199,47 @@ def validate_folder_target(target: str) -> None:
         raise ActionError(f"Folder target is not a directory: {folder}")
 
 
+def try_open_unrestricted(path_or_app: str) -> str:
+    """Attempt to open any file, folder, or app without allowlist restrictions.
+    
+    This function uses Windows APIs to open anything:
+    - Files: Opens with default application
+    - Folders: Opens in Windows Explorer
+    - Applications: Attempts to launch as executable
+    
+    Args:
+        path_or_app: File path, folder path, app name, or executable path
+        
+    Returns:
+        Success message
+        
+    Raises:
+        ActionError: If the open operation fails
+    """
+    target = path_or_app.strip()
+    if not target:
+        raise ActionError("Path or app name cannot be empty.")
+    
+    # Check for shell control characters (security check)
+    if any(char in target for char in ["|", "&", ";", "<", ">"]):
+        raise ActionError("Path contains shell control characters and cannot be opened.")
+    
+    # Expand user paths (~/ becomes home)
+    expanded_target = str(Path(target).expanduser())
+    
+    try:
+        # Try to open as a file/folder/URL using os.startfile
+        os.startfile(expanded_target)  # type: ignore[attr-defined]
+        return f"Done: Opened {target}."
+    except (OSError, TypeError):
+        # If os.startfile fails, try opening as executable
+        try:
+            subprocess.Popen([expanded_target])
+            return f"Done: Launched {target}."
+        except Exception as exc:
+            raise ActionError(f"Could not open or launch '{target}': {str(exc)}") from exc
+
+
 def normalize_action_text(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
@@ -323,5 +364,8 @@ def execute_action(action: PendingAction) -> str:
         except OSError as exc:
             raise ActionError(f"Could not open Windows location: {action.description}") from exc
         return f"Done: {action.description}."
+
+    if action.kind == "unrestricted":
+        return try_open_unrestricted(action.target)
 
     raise ActionError(f"Unsupported action type: {action.kind}")

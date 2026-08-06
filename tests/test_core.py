@@ -320,12 +320,74 @@ class LocalAssistantTests(unittest.TestCase):
         self.assertIsNone(response.pending_action)
 
     def test_unlisted_launch_attempt_is_blocked_with_request_guidance(self) -> None:
+        """Test that unlisted launches are allowed with default settings (allow_unrestricted_launch=True)."""
         assistant = LocalAssistant(use_llm=False)
 
         response = assistant.respond("open mystery app")
 
-        self.assertIn("Unlisted apps, scripts, files, and folders cannot open", response.text)
-        self.assertIsNone(response.pending_action)
+        # With default allow_unrestricted_launch=True, the launch is allowed (pending confirmation)
+        self.assertIn("Please confirm", response.text)
+        self.assertIsNotNone(response.pending_action)
+        assert response.pending_action is not None
+        self.assertEqual(response.pending_action.kind, "unrestricted")
+        self.assertIn("mystery app", response.pending_action.target)
+
+    def test_unlisted_launch_blocked_when_setting_disabled(self) -> None:
+        """Test that unlisted launches are blocked when allow_unrestricted_launch=False."""
+        import json
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings_path = root / "settings.json"
+            settings = {
+                "assistant_name": "Jarvis",
+                "use_ollama": False,
+                "allow_unrestricted_launch": False,
+            }
+            settings_path.write_text(json.dumps(settings), encoding="utf-8")
+            
+            assistant = LocalAssistant(use_llm=False, settings_path=settings_path)
+
+            response = assistant.respond("open mystery app")
+
+            self.assertIn("Unlisted apps, scripts, files, and folders cannot open", response.text)
+            self.assertIsNone(response.pending_action)
+
+    def test_parse_unrestricted_launch_from_various_prefixes(self) -> None:
+        """Test parsing unrestricted launches with different action prefixes."""
+        assistant = LocalAssistant(use_llm=False)
+        
+        test_cases = [
+            ("open test.txt", "test.txt"),
+            ("launch customapp.exe", "customapp.exe"),
+            ("start unlisted_app", "unlisted_app"),
+            ("open file myfile.pdf", "myfile.pdf"),
+            ("open folder projects", "projects"),
+            ("run script cleanup.ps1", "cleanup.ps1"),
+            ("execute backup.bat", "backup.bat"),
+        ]
+        
+        for command, expected_target_hint in test_cases:
+            response = assistant.respond(command)
+            self.assertIsNotNone(response.pending_action, f"Failed for: {command}")
+            assert response.pending_action is not None
+            self.assertEqual(response.pending_action.kind, "unrestricted", f"Wrong kind for: {command}")
+            self.assertIn(expected_target_hint.lower(), response.pending_action.target.lower(), f"Wrong target for: {command}")
+
+    def test_unrestricted_launch_action_description_varies_by_type(self) -> None:
+        """Test that unrestricted launch descriptions vary by file type."""
+        assistant = LocalAssistant(use_llm=False)
+        
+        exe_response = assistant.respond("launch tool.exe")
+        pdf_response = assistant.respond("open document.pdf")
+        generic_response = assistant.respond("launch mysterious_item")
+        
+        assert exe_response.pending_action is not None
+        assert pdf_response.pending_action is not None
+        assert generic_response.pending_action is not None
+        
+        self.assertIn("Launch application", exe_response.pending_action.description)
+        self.assertIn("Open file", pdf_response.pending_action.description)
+        self.assertIn("Open", generic_response.pending_action.description)
 
     def test_launch_request_commands_save_local_review_notes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

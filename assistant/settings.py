@@ -44,6 +44,12 @@ class AssistantSettings:
     persona_path: str = "config/persona.txt"
     aliases_path: str = "config/aliases.json"
     startup_briefing_enabled: bool = True
+    allow_unrestricted_launch: bool = True
+    system_indexing_enabled: bool = True
+    system_index_path: str = "data/system_index.jsonl"
+    system_index_preferences_path: str = "data/access_preferences.json"
+    system_index_auto_scan_enabled: bool = True
+    system_index_scan_interval_minutes: int = 60
 
     def summary(self) -> str:
         return (
@@ -72,7 +78,13 @@ class AssistantSettings:
             f"voice_action_audit_path={self.voice_action_audit_path}, "
             f"persona_path={self.persona_path}, "
             f"aliases_path={self.aliases_path}, "
-            f"startup_briefing_enabled={self.startup_briefing_enabled}"
+            f"startup_briefing_enabled={self.startup_briefing_enabled}, "
+            f"allow_unrestricted_launch={self.allow_unrestricted_launch}, "
+            f"system_indexing_enabled={self.system_indexing_enabled}, "
+            f"system_index_path={self.system_index_path}, "
+            f"system_index_preferences_path={self.system_index_preferences_path}, "
+            f"system_index_auto_scan_enabled={self.system_index_auto_scan_enabled}, "
+            f"system_index_scan_interval_minutes={self.system_index_scan_interval_minutes}"
         )
 
 
@@ -104,6 +116,12 @@ SETTING_TYPES = {
     "persona_path": str,
     "aliases_path": str,
     "startup_briefing_enabled": bool,
+    "allow_unrestricted_launch": bool,
+    "system_indexing_enabled": bool,
+    "system_index_path": str,
+    "system_index_preferences_path": str,
+    "system_index_auto_scan_enabled": bool,
+    "system_index_scan_interval_minutes": int,
 }
 
 
