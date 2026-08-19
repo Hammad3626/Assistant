@@ -26,17 +26,40 @@ class ScannerConfig:
         self.max_depth = max_depth
         self.skip_hidden = skip_hidden
         self.skip_patterns = skip_patterns or [
+            # System/OS folders
             r"^\$RECYCLE\.BIN$",
-            r"^\..*",  # Hidden files
-            r".*AppData.*",
-            r".*System32.*",
-            r".*Windows.*",
-            r".*Program Files.*\\.*",  # Exclude Program Files subdirs (scan only top level)
-            r".*ProgramData.*",
-            r".*node_modules.*",
+            r"^System Volume Information$",
+            r"^Recovery$",
+            r"^Recycler$",
+            r".*\$Recycle\.Bin.*",
+            r".*System Volume Information.*",
+            # Windows system files
+            r".*\\Windows\\.*",
+            r".*\\System32\\.*",
+            r".*\\SysWOW64\\.*",
+            r".*\\ProgramData\\.*",
+            r".*\\Program Files\\.*",  # Skip Program Files content (already indexed separately)
+            r".*\\Program Files \(x86\)\\.*",
+            # Temporary/Cache files
+            r".*\\Temp\\.*",
+            r".*\\tmp\\.*",
+            r".*\\Cache\\.*",
+            r".*\\AppData\\Local\\Temp.*",
+            r".*\\AppData\\LocalLow.*",
+            r".*\\AppData\\Roaming\\Microsoft\\Windows\\Recent.*",
+            # Version control and package managers
             r".*\.git.*",
-            r".*\.venv.*",
+            r".*\.svn.*",
+            r".*node_modules.*",
             r".*venv.*",
+            r".*\.venv.*",
+            r".*__pycache__.*",
+            # Hidden and system files
+            r"^\..*",
+            r".*\.(bak|tmp|temp|cache|log)$",
+            # Virtual/sparse files
+            r".*pagefile\.sys.*",
+            r".*hiberfil\.sys.*",
         ]
         self.max_workers = max_workers
         self.include_system_folders = include_system_folders

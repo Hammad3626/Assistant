@@ -99,6 +99,94 @@ class IndexBuilder:
         """Rebuild entire index from scratch."""
         return self.build_index_interactive()
 
+    def build_full_system_index(self) -> str:
+        """Build comprehensive index by scanning all available local drives."""
+        try:
+            from assistant.system_index import SystemIndex
+            index = SystemIndex()
+
+            # Get all available drives
+            available_drives = self.scanner.scan_drives()
+            print(f"Found {len(available_drives)} drive(s): {', '.join([f'{d}:' for d in available_drives])}")
+
+            # Scan each drive
+            for drive_letter in available_drives:
+                print(f"Scanning drive {drive_letter}:/...")
+                try:
+                    items = self.scanner.scan_drive(drive_letter)
+                    for item in items:
+                        index.add_item(item)
+                    print(f"  ✓ Drive {drive_letter}:/ complete ({len(items)} items)")
+                except Exception as e:
+                    print(f"  ✗ Error scanning drive {drive_letter}:/: {e}")
+                    continue
+
+            # Ensure applications are indexed
+            print("Detecting applications...")
+            try:
+                apps = self.scanner.detect_applications()
+                for app in apps:
+                    # Only add if not already present (avoid duplicates from drive scan)
+                    if index.get_item(app.id) is None:
+                        index.add_item(app)
+
+                shortcuts = self.scanner.detect_shortcuts()
+                for shortcut in shortcuts:
+                    if index.get_item(shortcut.id) is None:
+                        index.add_item(shortcut)
+            except Exception as e:
+                print(f"  Warning: Error detecting applications: {e}")
+
+            # Save index
+            self.store.save_index(index)
+
+            return (
+                f"Full system scan complete!\n"
+                f"Total items indexed: {index.total_items}\n"
+                f"Drives scanned: {', '.join([f'{d}:' for d in available_drives])}\n"
+                f"Saved to: {self.settings.system_index_path}"
+            )
+        except Exception as exc:
+            raise IndexBuildError(f"Full system scan failed: {exc}")
+
+    def build_drive_index(self, drive_letter: str) -> str:
+        """Build index for a specific drive."""
+        try:
+            from assistant.system_index import SystemIndex
+            
+            # Validate drive letter
+            if len(drive_letter) != 1 or not drive_letter.isalpha():
+                raise IndexBuildError(f"Invalid drive letter: {drive_letter}")
+            
+            drive_letter = drive_letter.upper()
+            drive_path = Path(f"{drive_letter}:\\")
+            
+            if not drive_path.exists():
+                raise IndexBuildError(f"Drive {drive_letter}:/ does not exist or is not accessible")
+
+            index = SystemIndex()
+            print(f"Scanning drive {drive_letter}:/...")
+
+            try:
+                items = self.scanner.scan_drive(drive_letter)
+                for item in items:
+                    index.add_item(item)
+            except Exception as e:
+                raise IndexBuildError(f"Error scanning drive {drive_letter}:/: {e}")
+
+            # Save index
+            self.store.save_index(index)
+
+            return (
+                f"Drive scan complete!\n"
+                f"Total items on {drive_letter}:/: {index.total_items}\n"
+                f"Saved to: {self.settings.system_index_path}"
+            )
+        except IndexBuildError:
+            raise
+        except Exception as exc:
+            raise IndexBuildError(f"Drive scan failed: {exc}")
+
     def get_index_stats(self) -> str:
         """Get statistics about current index."""
         try:

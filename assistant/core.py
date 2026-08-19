@@ -165,6 +165,7 @@ class LocalAssistant:
         # Pending search result for execution when user confirms
         self.pending_search_item: IndexedItem | None = None
         self.pending_search_query: str | None = None
+        self.pending_search_results: list | None = None  # Track multiple results for user selection
 
     def _build_system_index_text(self) -> str:
         """Build or rebuild the system index."""
@@ -183,6 +184,24 @@ class LocalAssistant:
             return builder.get_index_stats()
         except Exception as exc:
             return f"Index stats failed: {exc}. Try running 'scan system' first."
+
+    def _build_full_system_index_text(self) -> str:
+        """Build comprehensive system index by scanning all available drives."""
+        try:
+            from assistant.index_builder import IndexBuilder
+            builder = IndexBuilder()
+            return builder.build_full_system_index()
+        except Exception as exc:
+            return f"Full system scan failed: {exc}. Make sure system indexing is enabled in settings."
+
+    def _build_drive_index_text(self, drive_letter: str) -> str:
+        """Build index for a specific drive."""
+        try:
+            from assistant.index_builder import IndexBuilder
+            builder = IndexBuilder()
+            return builder.build_drive_index(drive_letter)
+        except Exception as exc:
+            return f"Drive scan failed: {exc}. Make sure drive '{drive_letter}:/' is accessible."
 
     def respond(self, user_text: str) -> AssistantResponse:
         """Return a response for one user message."""
@@ -209,6 +228,30 @@ class LocalAssistant:
 
         if normalized in {"exit", "quit", "bye"}:
             return AssistantResponse("Goodbye.", should_exit=True)
+
+        # Handle numeric selection from search results (when multiple matches found)
+        if (normalized.isdigit() and self.pending_search_results is not None):
+            try:
+                selection_index = int(normalized) - 1
+                if 0 <= selection_index < len(self.pending_search_results):
+                    selected_match = self.pending_search_results[selection_index]
+                    self.pending_search_item = selected_match.item
+                    self.pending_search_query = "user selected from search results"
+                    
+                    # Return confirmation
+                    action = PendingAction(
+                        kind="unrestricted",
+                        target=str(selected_match.item.full_path),
+                        description=f"Open: {selected_match.item.name}",
+                    )
+                    return AssistantResponse(
+                        f"Please confirm: {action.description}. Type 'yes' to continue.",
+                        pending_action=action,
+                    )
+                else:
+                    return AssistantResponse(f"Please select a number between 1 and {len(self.pending_search_results)}.")
+            except Exception as e:
+                return AssistantResponse(f"Error processing selection: {e}")
 
         # Handle confirmation of pending search result
         if normalized == "yes" and self.pending_search_item is not None:
@@ -481,8 +524,17 @@ class LocalAssistant:
         if normalized in {"scan system", "build index", "index system"}:
             return AssistantResponse(self._build_system_index_text())
 
+        if normalized in {"full system scan", "scan all drives", "scan all", "complete system scan", "full scan"}:
+            return AssistantResponse(self._build_full_system_index_text())
+
         if normalized in {"index stats", "index status", "system index status"}:
             return AssistantResponse(self._system_index_stats_text())
+
+        # Handle "scan D:" or "scan E:" style commands
+        if normalized.startswith("scan ") and len(normalized.split()) == 2:
+            potential_drive = normalized.split()[1].rstrip(":/\\")
+            if len(potential_drive) == 1 and potential_drive.isalpha():
+                return AssistantResponse(self._build_drive_index_text(potential_drive))
 
         if normalized in {"paths", "file paths", "data paths", "where is my data"}:
             return AssistantResponse(self._paths_text())
@@ -781,6 +833,14 @@ class LocalAssistant:
                 pending_action=action,
             )
 
+        # TRY SYSTEM INDEX SEARCH FIRST before unrestricted launch
+        # This allows "open forza horizon 3" to find the indexed game instead of treating it as a literal path
+        if self._looks_like_search_query(normalized):
+            search_text, pending_action = self._search_and_open_system_item(user_text)
+            if not search_text.startswith("Unknown command"):
+                return AssistantResponse(search_text, pending_action=pending_action)
+
+        # Then fall back to unrestricted launch for literal paths
         if self._looks_like_unlisted_launch_request(normalized):
             # Allow unrestricted launches if setting is enabled
             try:
@@ -804,13 +864,6 @@ class LocalAssistant:
 
         if self.use_llm:
             return self._respond_with_llm(user_text.strip())
-
-        # Try system indexing search as fallback for natural language file/folder/app queries
-        # Only attempt search for simple natural language-like queries (not structured commands)
-        if self._looks_like_search_query(normalized):
-            search_text, pending_action = self._search_and_open_system_item(user_text)
-            if not search_text.startswith("Unknown command"):
-                return AssistantResponse(search_text, pending_action=pending_action)
 
         return AssistantResponse(unknown_command_text(user_text))
 
@@ -2407,23 +2460,88 @@ class LocalAssistant:
         return AssistantResponse(answer)
 
     def _looks_like_search_query(self, normalized: str) -> bool:
-        """Check if the normalized query looks like a natural language search for files/folders/apps."""
-        # Exclude structured commands with colons, slashes, special chars
-        if ":" in normalized or "//" in normalized or " and " in normalized:
+        """Check if the query looks like a search for files/folders/apps.
+        
+        A search query must:
+        1. Start with a launch prefix (open, launch, run, etc.)
+        2. NOT look like a literal data file path
+        3. The system index file must actually exist (not just be enabled)
+        """
+        # Check if index file actually exists - if not, this isn't a search query
+        try:
+            from assistant.settings import load_settings
+            settings = load_settings(self.settings_path)
+            if not settings.system_indexing_enabled:
+                return False
+            # Check if the index file actually exists
+            index_path = Path(settings.system_index_path)
+            if not index_path.exists():
+                return False  # No index file, not a search query
+        except Exception:
+            return False  # Can't verify, not a search query
+        
+        # Check if it starts with a launch/search prefix
+        launch_prefixes = (
+            "open file ",
+            "open folder ",
+            "open document ",
+            "run script ",
+            "run unlisted ",
+            "open ",
+            "launch ",
+            "start ",
+            "run ",
+            "execute ",
+            "find ",
+        )
+        
+        if not normalized.startswith(launch_prefixes):
+            return False  # Doesn't look like a search request
+        
+        # Extract the search term (remove launch prefix)
+        search_term = normalized
+        for prefix in launch_prefixes:
+            if normalized.startswith(prefix):
+                search_term = normalized[len(prefix):].strip()
+                break
+        
+        # Very short search terms are not valid searches
+        if len(search_term) < 2:
             return False
         
-        # Exclude very short queries (likely not file/folder searches)
-        if len(normalized) < 3:
+        # Treat certain file extensions as literal paths (documents, data files)
+        # But allow executable extensions since they're often games/apps
+        if "." in search_term:
+            last_dot_pos = search_term.rfind(".")
+            potential_ext = search_term[last_dot_pos:].lower()
+            
+            # Extensions to skip (treat as literal file paths, not searches)
+            literal_file_extensions = {
+                '.txt', '.pdf', '.doc', '.docx', '.xlsx', '.csv', 
+                '.json', '.xml', '.html', '.css', '.js', '.py', 
+                '.java', '.cpp', '.c', '.h', '.hpp',
+                '.zip', '.rar', '.7z', '.tar', '.gz',
+                '.jpg', '.jpeg', '.png', '.gif', '.bmp',
+                '.mp3', '.mp4', '.avi', '.mkv',
+                '.iso'  # ISO files are data, not apps
+            }
+            
+            # Executable extensions that should still be searched
+            executable_extensions = {
+                '.exe', '.bat', '.cmd', '.com', '.ps1', '.vbs',
+                '.lnk',  # shortcuts
+                '.msi'   # installers
+            }
+            
+            if potential_ext in literal_file_extensions:
+                return False  # Treat as literal file path
+            # For other extensions (including .exe), continue to search
+        
+        # If it contains path separators, treat as literal path
+        if "\\" in search_term or "/" in search_term:
             return False
         
-        # Exclude queries with numbers followed by colons (likely commands like "python 3:")
-        if any(char.isdigit() for char in normalized[:5]) and ":" in normalized:
-            return False
-        
-        # Exclude queries with multiple spaces followed by colons
-        if normalized.count(" ") > 2 and ":" in normalized:
-            return False
-        
+        # This is a potential search query - index search will determine if it matches
         return True
 
     def _init_system_indexing(self) -> bool:
@@ -2450,20 +2568,53 @@ class LocalAssistant:
             return False
 
     def _search_and_open_system_item(self, query: str) -> tuple[str, PendingAction | None]:
-        """Search index for item matching query. Returns (text_response, pending_action)."""
+        """Search index for item matching query. Returns (text_response, pending_action).
+        
+        Returns:
+        - If match found: returns message describing match + PendingAction
+        - If no matches: returns message starting with "Unknown command" + None (to fall through)
+        """
         if not self._init_system_indexing():
-            return unknown_command_text(query), None
+            return "Unknown command (index not available)", None
 
         if self.system_search is None:
-            return unknown_command_text(query), None
+            return "Unknown command (search not available)", None
+
+        # Extract search term by removing launch prefixes
+        normalized = query.strip().lower()
+        search_term = normalized
+        
+        prefixes = [
+            "open file ",
+            "open folder ",
+            "open document ",
+            "run script ",
+            "run unlisted ",
+            "open ",
+            "launch ",
+            "start ",
+            "run ",
+            "execute ",
+            "find ",
+        ]
+        
+        for prefix in prefixes:
+            if normalized.startswith(prefix):
+                search_term = query[len(prefix):].strip()
+                break
+        
+        # If search term is too short, return no results (treat as unknown command)
+        if not search_term or len(search_term) < 2:
+            return "Unknown command (search term too short)", None
 
         try:
-            matches = self.system_search.search(query.strip(), limit=5)
-        except Exception:
-            return unknown_command_text(query), None
+            matches = self.system_search.search(search_term, limit=5)
+        except Exception as e:
+            return f"Unknown command (search failed: {e})", None
 
+        # If no matches found, fall through to unrestricted launch or other handlers
         if not matches:
-            return f"No items found matching '{query}'. Try being more specific.", None
+            return f"Unknown command (no items found for '{search_term}')", None
 
         # Single match: offer to open with pending action
         if len(matches) == 1:
@@ -2473,8 +2624,9 @@ class LocalAssistant:
             # Store for potential execution
             self.pending_search_item = match.item
             self.pending_search_query = query
+            self.pending_search_results = None  # Clear multiple results
             
-            # Create pending action for unrestricted launch
+            # Create pending action for unrestricted launch with FULL PATH
             action = PendingAction(
                 kind="unrestricted",
                 target=str(match.item.full_path),
@@ -2487,7 +2639,11 @@ class LocalAssistant:
                 action,
             )
 
-        # Multiple matches: present options (no pending action yet)
+        # Multiple matches: present options (store results for user selection)
+        self.pending_search_results = matches
+        self.pending_search_query = query
+        self.pending_search_item = None  # Clear single item
+        
         options_text = "\n".join(
             f"  {i+1}. {match.item.name} ({match.item.item_type}) - {match.score:.0%} match"
             for i, match in enumerate(matches)
