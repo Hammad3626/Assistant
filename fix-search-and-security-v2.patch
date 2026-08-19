@@ -1,0 +1,398 @@
+diff --git a/assistant/actions.py b/assistant/actions.py
+index 210470b..0a06a70 100644
+--- a/assistant/actions.py
++++ b/assistant/actions.py
+@@ -25,9 +25,40 @@ DENIED_EXECUTABLES = {
+     "cscript.exe",
+     "regedit.exe",
+     "reg.exe",
++    "mshta.exe",
++    "msiexec.exe",
++    "bitsadmin.exe",
++    "certutil.exe",
++    "rundll32.exe",
++    "regsvr32.exe",
++    "installutil.exe",
++    "control.exe",
++    "diskpart.exe",
++    "net.exe",
++    "net1.exe",
++    "sc.exe",
++    "schtasks.exe",
++    "taskkill.exe",
++    "wmic.exe",
++    "at.exe",
++    "gpupdate.exe",
++    "gpresult.exe",
+ }
+ 
+ 
++def _denied_executable_names() -> set[str]:
++    """Denylist names both with and without the .exe suffix, so bare names
++    like 'cmd' or 'powershell' (no extension typed by the user) are also
++    caught, not just fully-qualified 'cmd.exe'.
++    """
++    names: set[str] = set()
++    for entry in DENIED_EXECUTABLES:
++        names.add(entry)
++        if entry.lower().endswith(".exe"):
++            names.add(entry[: -len(".exe")])
++    return names
++
++
+ class ActionError(RuntimeError):
+     """Raised when a safe local action cannot be completed."""
+ 
+@@ -219,7 +250,8 @@ def try_open_unrestricted(path_or_app: str) -> str:
+         Success message
+         
+     Raises:
+-        ActionError: If the open operation fails
++        ActionError: If the open operation fails, or if the target matches
++            a denylisted system executable (cmd, powershell, regedit, etc.).
+     """
+     target = path_or_app.strip()
+     if not target:
+@@ -228,6 +260,21 @@ def try_open_unrestricted(path_or_app: str) -> str:
+     # Check for shell control characters (security check)
+     if any(char in target for char in ["|", "&", ";", "<", ">"]):
+         raise ActionError("Path contains shell control characters and cannot be opened.")
++
++    # Block denylisted system executables even when "unrestricted" launch is
++    # enabled. This mirrors validate_app_target()'s check, which this
++    # unrestricted path otherwise bypasses entirely. Check both the bare
++    # target text (e.g. "cmd", "powershell") and the resolved path's
++    # filename (e.g. "C:\\Windows\\System32\\cmd.exe"). We split on both
++    # '/' and '\\' manually (rather than relying on Path.name) because
++    # pathlib only treats '\\' as a separator on Windows, and this check
++    # must also work when tested on non-Windows hosts.
++    denied_names = _denied_executable_names()
++    target_name = re.split(r"[\\/]", target)[-1].lower()
++    if target.lower() in denied_names or target_name in denied_names:
++        raise ActionError(
++            f"'{target}' is a restricted system executable and cannot be opened."
++        )
+     
+     # Expand user paths (~/ becomes home)
+     expanded_target = str(Path(target).expanduser())
+@@ -239,8 +286,15 @@ def try_open_unrestricted(path_or_app: str) -> str:
+     except (OSError, TypeError):
+         # If os.startfile fails, try opening as executable
+         try:
++            resolved_name = re.split(r"[\\/]", expanded_target)[-1].lower()
++            if resolved_name in denied_names:
++                raise ActionError(
++                    f"'{target}' is a restricted system executable and cannot be opened."
++                )
+             subprocess.Popen([expanded_target])
+             return f"Done: Launched {target}."
++        except ActionError:
++            raise
+         except Exception as exc:
+             raise ActionError(f"Could not open or launch '{target}': {str(exc)}") from exc
+ 
+diff --git a/assistant/core.py b/assistant/core.py
+index 2037adc..3162f80 100644
+--- a/assistant/core.py
++++ b/assistant/core.py
+@@ -829,7 +829,7 @@ class LocalAssistant:
+         action = parse_action(user_text)
+         if action:
+             return AssistantResponse(
+-                f"Please confirm: {action.description}. Type 'yes' to continue.",
++                f"Please confirm (allowlisted): {action.description}. Type 'yes' to continue.",
+                 pending_action=action,
+             )
+ 
+@@ -850,7 +850,8 @@ class LocalAssistant:
+                     unrestricted_action = self._parse_unrestricted_launch(normalized)
+                     if unrestricted_action:
+                         return AssistantResponse(
+-                            f"Please confirm: {unrestricted_action.description}. Type 'yes' to continue.",
++                            f"Please confirm (UNVERIFIED PATH \u2014 not in your allowlist or index): "
++                            f"{unrestricted_action.description}. Type 'yes' to continue.",
+                             pending_action=unrestricted_action,
+                         )
+             except Exception:
+@@ -2634,7 +2635,7 @@ class LocalAssistant:
+             )
+             
+             return (
+-                f"Found '{match.item.name}' ({confidence} match). "
++                f"Found '{match.item.name}' ({confidence} match, indexed). "
+                 f"Would you like me to open it? (Reply 'yes')",
+                 action,
+             )
+diff --git a/assistant/safety.py b/assistant/safety.py
+index 2dd09e0..ddd35ab 100644
+--- a/assistant/safety.py
++++ b/assistant/safety.py
+@@ -83,7 +83,7 @@ def safety_text(allowed_actions_summary: str) -> str:
+             "- Reading files outside allowlisted folders.",
+             "- Sending messages or emails on your behalf.",
+             "- Making network requests on your behalf, except existing local assistant health/model checks.",
+-            "- Opening unlisted apps or folders.",
++            "- Opening unlisted apps or folders as an explicit opt-in (off by default; still confirmation-gated and denylist-enforced against system tools like cmd/powershell/regedit).",
+             "- Opening arbitrary files or documents outside designed allowlists.",
+             "- Running cmd.exe, powershell.exe, pwsh.exe, scripts, or registry tools as app actions.",
+             "- Auto-adding unlisted apps or scripts to allowlists.",
+diff --git a/assistant/settings.py b/assistant/settings.py
+index 94578e9..e26a6b9 100644
+--- a/assistant/settings.py
++++ b/assistant/settings.py
+@@ -44,7 +44,7 @@ class AssistantSettings:
+     persona_path: str = "config/persona.txt"
+     aliases_path: str = "config/aliases.json"
+     startup_briefing_enabled: bool = True
+-    allow_unrestricted_launch: bool = True
++    allow_unrestricted_launch: bool = False
+     system_indexing_enabled: bool = True
+     system_index_path: str = "data/system_index.jsonl"
+     system_index_preferences_path: str = "data/access_preferences.json"
+diff --git a/assistant/system_search.py b/assistant/system_search.py
+index 9ca52e7..2f70ce5 100644
+--- a/assistant/system_search.py
++++ b/assistant/system_search.py
+@@ -63,6 +63,22 @@ class FuzzyMatcher:
+         distance = FuzzyMatcher.levenshtein_distance(s1_lower, s2_lower)
+         return 1.0 - (distance / max_len)
+ 
++    @staticmethod
++    def normalize(text: str) -> str:
++        """Lowercase and turn separators like '-', '_', '.' into spaces so that
++        'Spider-Man', 'Spider_Man', and 'spider man' all compare equal. Also
++        splits camelCase boundaries ('SpiderMan' -> 'spider man') so squashed
++        together app/game names are still matchable.
++        """
++        import re as _re
++
++        # Insert a space at lower->Upper camelCase boundaries first, while the
++        # original casing is still available.
++        spaced = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
++        # Replace common separators with spaces.
++        spaced = _re.sub(r"[-_.]+", " ", spaced)
++        return " ".join(spaced.lower().split())
++
+     @staticmethod
+     def partial_match(query: str, text: str) -> float:
+         """Check if query is a substring of text, return partial score."""
+@@ -78,13 +94,25 @@ class FuzzyMatcher:
+                 return 0.95
+             return 0.8
+ 
++        # Fall back to normalized forms so separators (-, _, .) and camelCase
++        # boundaries don't prevent an otherwise obvious match, e.g. query
++        # "spider man" against "Spider-Man Remastered.exe" or "SpiderMan.exe".
++        norm_query = FuzzyMatcher.normalize(query)
++        norm_text = FuzzyMatcher.normalize(text)
++        if norm_query and norm_query == norm_text:
++            return 1.0
++        if norm_query and norm_query in norm_text:
++            if norm_text.startswith(norm_query):
++                return 0.9
++            return 0.7
++
+         return 0.0
+ 
+     @staticmethod
+     def starts_with_words(query: str, text: str) -> float:
+         """Check if words in query appear at start of words in text."""
+-        query_words = query.lower().split()
+-        text_words = text.lower().split()
++        query_words = FuzzyMatcher.normalize(query).split()
++        text_words = FuzzyMatcher.normalize(text).split()
+ 
+         if not query_words:
+             return 0.0
+@@ -163,7 +191,7 @@ class SystemSearch:
+ 
+         # Word-based matching
+         word_score = FuzzyMatcher.starts_with_words(query, item.name)
+-        if word_score > 0.5:
++        if word_score >= 0.5:
+             return 0.80 * word_score, "fuzzy", f"Word match ({word_score:.0%})"
+ 
+         # Fuzzy matching
+diff --git a/tests/test_actions.py b/tests/test_actions.py
+index 825cb10..f99d135 100644
+--- a/tests/test_actions.py
++++ b/tests/test_actions.py
+@@ -198,6 +198,46 @@ class ActionTests(unittest.TestCase):
+         
+         self.assertIn("shell control", str(context.exception))
+ 
++    def test_try_open_unrestricted_rejects_denied_system_executables(self) -> None:
++        """Regression test: the unrestricted-launch path must enforce the same
++        denylist as validate_app_target(), so cmd/powershell/regedit/etc cannot
++        be launched just because they weren't in the allowlisted-apps flow.
++        """
++        from assistant.actions import try_open_unrestricted, ActionError
++
++        denied_targets = [
++            "cmd",
++            "cmd.exe",
++            "powershell",
++            "powershell.exe",
++            "PowerShell.EXE",
++            "pwsh.exe",
++            "regedit",
++            "regedit.exe",
++            "reg.exe",
++            "wscript.exe",
++            "cscript.exe",
++            "C:\\Windows\\System32\\cmd.exe",
++        ]
++        for target in denied_targets:
++            with self.assertRaises(ActionError, msg=f"Should have blocked: {target}"):
++                try_open_unrestricted(target)
++
++    @patch("assistant.actions.subprocess.Popen")
++    @patch("assistant.actions.os.startfile", create=True, side_effect=OSError("Not a file"))
++    def test_try_open_unrestricted_rejects_denied_executable_on_subprocess_fallback(
++        self, mock_startfile, mock_popen
++    ) -> None:
++        """Regression test: the denylist must also apply on the subprocess.Popen
++        fallback path (when os.startfile fails), not just the initial check.
++        """
++        from assistant.actions import try_open_unrestricted, ActionError
++
++        with self.assertRaises(ActionError):
++            try_open_unrestricted("cmd.exe")
++
++        mock_popen.assert_not_called()
++
+     @patch("assistant.actions.os.startfile", create=True)
+     def test_execute_unrestricted_action(self, mock_startfile) -> None:
+         """Test executing an unrestricted action."""
+diff --git a/tests/test_core.py b/tests/test_core.py
+index 8ef03a4..e762e2f 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -320,17 +320,15 @@ class LocalAssistantTests(unittest.TestCase):
+         self.assertIsNone(response.pending_action)
+ 
+     def test_unlisted_launch_attempt_is_blocked_with_request_guidance(self) -> None:
+-        """Test that unlisted launches are allowed with default settings (allow_unrestricted_launch=True)."""
++        """Test that unlisted launches are blocked with default settings (allow_unrestricted_launch=False)."""
+         assistant = LocalAssistant(use_llm=False)
+ 
+         response = assistant.respond("open mystery app")
+ 
+-        # With default allow_unrestricted_launch=True, the launch is allowed (pending confirmation)
+-        self.assertIn("Please confirm", response.text)
+-        self.assertIsNotNone(response.pending_action)
+-        assert response.pending_action is not None
+-        self.assertEqual(response.pending_action.kind, "unrestricted")
+-        self.assertIn("mystery app", response.pending_action.target)
++        # With the secure-by-default allow_unrestricted_launch=False, the
++        # launch is blocked and guidance to request review is shown instead.
++        self.assertIn("Unlisted apps, scripts, files, and folders cannot open", response.text)
++        self.assertIsNone(response.pending_action)
+ 
+     def test_unlisted_launch_blocked_when_setting_disabled(self) -> None:
+         """Test that unlisted launches are blocked when allow_unrestricted_launch=False."""
+@@ -354,40 +352,54 @@ class LocalAssistantTests(unittest.TestCase):
+ 
+     def test_parse_unrestricted_launch_from_various_prefixes(self) -> None:
+         """Test parsing unrestricted launches with different action prefixes."""
+-        assistant = LocalAssistant(use_llm=False)
+-        
+-        test_cases = [
+-            ("open test.txt", "test.txt"),
+-            ("launch customapp.exe", "customapp.exe"),
+-            ("start unlisted_app", "unlisted_app"),
+-            ("open file myfile.pdf", "myfile.pdf"),
+-            ("open folder projects", "projects"),
+-            ("run script cleanup.ps1", "cleanup.ps1"),
+-            ("execute backup.bat", "backup.bat"),
+-        ]
+-        
+-        for command, expected_target_hint in test_cases:
+-            response = assistant.respond(command)
+-            self.assertIsNotNone(response.pending_action, f"Failed for: {command}")
+-            assert response.pending_action is not None
+-            self.assertEqual(response.pending_action.kind, "unrestricted", f"Wrong kind for: {command}")
+-            self.assertIn(expected_target_hint.lower(), response.pending_action.target.lower(), f"Wrong target for: {command}")
++        import json
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root = Path(temp_dir)
++            settings_path = root / "settings.json"
++            settings_path.write_text(
++                json.dumps({"allow_unrestricted_launch": True}), encoding="utf-8"
++            )
++            assistant = LocalAssistant(use_llm=False, settings_path=settings_path)
++
++            test_cases = [
++                ("open test.txt", "test.txt"),
++                ("launch customapp.exe", "customapp.exe"),
++                ("start unlisted_app", "unlisted_app"),
++                ("open file myfile.pdf", "myfile.pdf"),
++                ("open folder projects", "projects"),
++                ("run script cleanup.ps1", "cleanup.ps1"),
++                ("execute backup.bat", "backup.bat"),
++            ]
++
++            for command, expected_target_hint in test_cases:
++                response = assistant.respond(command)
++                self.assertIsNotNone(response.pending_action, f"Failed for: {command}")
++                assert response.pending_action is not None
++                self.assertEqual(response.pending_action.kind, "unrestricted", f"Wrong kind for: {command}")
++                self.assertIn(expected_target_hint.lower(), response.pending_action.target.lower(), f"Wrong target for: {command}")
+ 
+     def test_unrestricted_launch_action_description_varies_by_type(self) -> None:
+         """Test that unrestricted launch descriptions vary by file type."""
+-        assistant = LocalAssistant(use_llm=False)
+-        
+-        exe_response = assistant.respond("launch tool.exe")
+-        pdf_response = assistant.respond("open document.pdf")
+-        generic_response = assistant.respond("launch mysterious_item")
+-        
+-        assert exe_response.pending_action is not None
+-        assert pdf_response.pending_action is not None
+-        assert generic_response.pending_action is not None
+-        
+-        self.assertIn("Launch application", exe_response.pending_action.description)
+-        self.assertIn("Open file", pdf_response.pending_action.description)
+-        self.assertIn("Open", generic_response.pending_action.description)
++        import json
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root = Path(temp_dir)
++            settings_path = root / "settings.json"
++            settings_path.write_text(
++                json.dumps({"allow_unrestricted_launch": True}), encoding="utf-8"
++            )
++            assistant = LocalAssistant(use_llm=False, settings_path=settings_path)
++
++            exe_response = assistant.respond("launch tool.exe")
++            pdf_response = assistant.respond("open document.pdf")
++            generic_response = assistant.respond("launch mysterious_item")
++
++            assert exe_response.pending_action is not None
++            assert pdf_response.pending_action is not None
++            assert generic_response.pending_action is not None
++
++            self.assertIn("Launch application", exe_response.pending_action.description)
++            self.assertIn("Open file", pdf_response.pending_action.description)
++            self.assertIn("Open", generic_response.pending_action.description)
+ 
+     def test_launch_request_commands_save_local_review_notes(self) -> None:
+         with tempfile.TemporaryDirectory() as temp_dir:
+diff --git a/tests/test_settings.py b/tests/test_settings.py
+index 7dd9097..08c096c 100644
+--- a/tests/test_settings.py
++++ b/tests/test_settings.py
+@@ -28,6 +28,14 @@ class SettingsTests(unittest.TestCase):
+         self.assertEqual(settings.voice_sample_rate, 16000)
+         self.assertTrue(settings.voice_debug_enabled)
+ 
++    def test_unrestricted_launch_is_disabled_by_default(self) -> None:
++        """Regression test: unrestricted launch must default to off so raw,
++        unverified paths (including denylisted system tools) require an
++        explicit opt-in rather than being allowed out of the box.
++        """
++        settings = load_settings("missing-settings-file.json")
++        self.assertFalse(settings.allow_unrestricted_launch)
++
+     def test_load_settings_from_json(self) -> None:
+         with tempfile.TemporaryDirectory() as temp_dir:
+             path = Path(temp_dir) / "settings.json"

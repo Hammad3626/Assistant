@@ -64,6 +64,22 @@ class FuzzyMatcher:
         return 1.0 - (distance / max_len)
 
     @staticmethod
+    def normalize(text: str) -> str:
+        """Lowercase and turn separators like '-', '_', '.' into spaces so that
+        'Spider-Man', 'Spider_Man', and 'spider man' all compare equal. Also
+        splits camelCase boundaries ('SpiderMan' -> 'spider man') so squashed
+        together app/game names are still matchable.
+        """
+        import re as _re
+
+        # Insert a space at lower->Upper camelCase boundaries first, while the
+        # original casing is still available.
+        spaced = _re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+        # Replace common separators with spaces.
+        spaced = _re.sub(r"[-_.]+", " ", spaced)
+        return " ".join(spaced.lower().split())
+
+    @staticmethod
     def partial_match(query: str, text: str) -> float:
         """Check if query is a substring of text, return partial score."""
         query_lower = query.lower()
@@ -78,13 +94,25 @@ class FuzzyMatcher:
                 return 0.95
             return 0.8
 
+        # Fall back to normalized forms so separators (-, _, .) and camelCase
+        # boundaries don't prevent an otherwise obvious match, e.g. query
+        # "spider man" against "Spider-Man Remastered.exe" or "SpiderMan.exe".
+        norm_query = FuzzyMatcher.normalize(query)
+        norm_text = FuzzyMatcher.normalize(text)
+        if norm_query and norm_query == norm_text:
+            return 1.0
+        if norm_query and norm_query in norm_text:
+            if norm_text.startswith(norm_query):
+                return 0.9
+            return 0.7
+
         return 0.0
 
     @staticmethod
     def starts_with_words(query: str, text: str) -> float:
         """Check if words in query appear at start of words in text."""
-        query_words = query.lower().split()
-        text_words = text.lower().split()
+        query_words = FuzzyMatcher.normalize(query).split()
+        text_words = FuzzyMatcher.normalize(text).split()
 
         if not query_words:
             return 0.0
@@ -163,7 +191,7 @@ class SystemSearch:
 
         # Word-based matching
         word_score = FuzzyMatcher.starts_with_words(query, item.name)
-        if word_score > 0.5:
+        if word_score >= 0.5:
             return 0.80 * word_score, "fuzzy", f"Word match ({word_score:.0%})"
 
         # Fuzzy matching

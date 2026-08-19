@@ -198,6 +198,46 @@ class ActionTests(unittest.TestCase):
         
         self.assertIn("shell control", str(context.exception))
 
+    def test_try_open_unrestricted_rejects_denied_system_executables(self) -> None:
+        """Regression test: the unrestricted-launch path must enforce the same
+        denylist as validate_app_target(), so cmd/powershell/regedit/etc cannot
+        be launched just because they weren't in the allowlisted-apps flow.
+        """
+        from assistant.actions import try_open_unrestricted, ActionError
+
+        denied_targets = [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "PowerShell.EXE",
+            "pwsh.exe",
+            "regedit",
+            "regedit.exe",
+            "reg.exe",
+            "wscript.exe",
+            "cscript.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+        ]
+        for target in denied_targets:
+            with self.assertRaises(ActionError, msg=f"Should have blocked: {target}"):
+                try_open_unrestricted(target)
+
+    @patch("assistant.actions.subprocess.Popen")
+    @patch("assistant.actions.os.startfile", create=True, side_effect=OSError("Not a file"))
+    def test_try_open_unrestricted_rejects_denied_executable_on_subprocess_fallback(
+        self, mock_startfile, mock_popen
+    ) -> None:
+        """Regression test: the denylist must also apply on the subprocess.Popen
+        fallback path (when os.startfile fails), not just the initial check.
+        """
+        from assistant.actions import try_open_unrestricted, ActionError
+
+        with self.assertRaises(ActionError):
+            try_open_unrestricted("cmd.exe")
+
+        mock_popen.assert_not_called()
+
     @patch("assistant.actions.os.startfile", create=True)
     def test_execute_unrestricted_action(self, mock_startfile) -> None:
         """Test executing an unrestricted action."""

@@ -28,6 +28,14 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.voice_sample_rate, 16000)
         self.assertTrue(settings.voice_debug_enabled)
 
+    def test_unrestricted_launch_is_disabled_by_default(self) -> None:
+        """Regression test: unrestricted launch must default to off so raw,
+        unverified paths (including denylisted system tools) require an
+        explicit opt-in rather than being allowed out of the box.
+        """
+        settings = load_settings("missing-settings-file.json")
+        self.assertFalse(settings.allow_unrestricted_launch)
+
     def test_load_settings_from_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "settings.json"

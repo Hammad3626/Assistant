@@ -25,7 +25,38 @@ DENIED_EXECUTABLES = {
     "cscript.exe",
     "regedit.exe",
     "reg.exe",
+    "mshta.exe",
+    "msiexec.exe",
+    "bitsadmin.exe",
+    "certutil.exe",
+    "rundll32.exe",
+    "regsvr32.exe",
+    "installutil.exe",
+    "control.exe",
+    "diskpart.exe",
+    "net.exe",
+    "net1.exe",
+    "sc.exe",
+    "schtasks.exe",
+    "taskkill.exe",
+    "wmic.exe",
+    "at.exe",
+    "gpupdate.exe",
+    "gpresult.exe",
 }
+
+
+def _denied_executable_names() -> set[str]:
+    """Denylist names both with and without the .exe suffix, so bare names
+    like 'cmd' or 'powershell' (no extension typed by the user) are also
+    caught, not just fully-qualified 'cmd.exe'.
+    """
+    names: set[str] = set()
+    for entry in DENIED_EXECUTABLES:
+        names.add(entry)
+        if entry.lower().endswith(".exe"):
+            names.add(entry[: -len(".exe")])
+    return names
 
 
 class ActionError(RuntimeError):
@@ -219,7 +250,8 @@ def try_open_unrestricted(path_or_app: str) -> str:
         Success message
         
     Raises:
-        ActionError: If the open operation fails
+        ActionError: If the open operation fails, or if the target matches
+            a denylisted system executable (cmd, powershell, regedit, etc.).
     """
     target = path_or_app.strip()
     if not target:
@@ -228,6 +260,21 @@ def try_open_unrestricted(path_or_app: str) -> str:
     # Check for shell control characters (security check)
     if any(char in target for char in ["|", "&", ";", "<", ">"]):
         raise ActionError("Path contains shell control characters and cannot be opened.")
+
+    # Block denylisted system executables even when "unrestricted" launch is
+    # enabled. This mirrors validate_app_target()'s check, which this
+    # unrestricted path otherwise bypasses entirely. Check both the bare
+    # target text (e.g. "cmd", "powershell") and the resolved path's
+    # filename (e.g. "C:\\Windows\\System32\\cmd.exe"). We split on both
+    # '/' and '\\' manually (rather than relying on Path.name) because
+    # pathlib only treats '\\' as a separator on Windows, and this check
+    # must also work when tested on non-Windows hosts.
+    denied_names = _denied_executable_names()
+    target_name = re.split(r"[\\/]", target)[-1].lower()
+    if target.lower() in denied_names or target_name in denied_names:
+        raise ActionError(
+            f"'{target}' is a restricted system executable and cannot be opened."
+        )
     
     # Expand user paths (~/ becomes home)
     expanded_target = str(Path(target).expanduser())
@@ -239,8 +286,15 @@ def try_open_unrestricted(path_or_app: str) -> str:
     except (OSError, TypeError):
         # If os.startfile fails, try opening as executable
         try:
+            resolved_name = re.split(r"[\\/]", expanded_target)[-1].lower()
+            if resolved_name in denied_names:
+                raise ActionError(
+                    f"'{target}' is a restricted system executable and cannot be opened."
+                )
             subprocess.Popen([expanded_target])
             return f"Done: Launched {target}."
+        except ActionError:
+            raise
         except Exception as exc:
             raise ActionError(f"Could not open or launch '{target}': {str(exc)}") from exc
 

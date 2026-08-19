@@ -83,7 +83,7 @@ def safety_text(allowed_actions_summary: str) -> str:
             "- Reading files outside allowlisted folders.",
             "- Sending messages or emails on your behalf.",
             "- Making network requests on your behalf, except existing local assistant health/model checks.",
-            "- Opening unlisted apps or folders.",
+            "- Opening unlisted apps or folders as an explicit opt-in (off by default; still confirmation-gated and denylist-enforced against system tools like cmd/powershell/regedit).",
             "- Opening arbitrary files or documents outside designed allowlists.",
             "- Running cmd.exe, powershell.exe, pwsh.exe, scripts, or registry tools as app actions.",
             "- Auto-adding unlisted apps or scripts to allowlists.",

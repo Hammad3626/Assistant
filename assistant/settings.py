@@ -44,7 +44,7 @@ class AssistantSettings:
     persona_path: str = "config/persona.txt"
     aliases_path: str = "config/aliases.json"
     startup_briefing_enabled: bool = True
-    allow_unrestricted_launch: bool = True
+    allow_unrestricted_launch: bool = False
     system_indexing_enabled: bool = True
     system_index_path: str = "data/system_index.jsonl"
     system_index_preferences_path: str = "data/access_preferences.json"

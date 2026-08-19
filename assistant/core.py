@@ -829,7 +829,7 @@ class LocalAssistant:
         action = parse_action(user_text)
         if action:
             return AssistantResponse(
-                f"Please confirm: {action.description}. Type 'yes' to continue.",
+                f"Please confirm (allowlisted): {action.description}. Type 'yes' to continue.",
                 pending_action=action,
             )
 
@@ -850,7 +850,8 @@ class LocalAssistant:
                     unrestricted_action = self._parse_unrestricted_launch(normalized)
                     if unrestricted_action:
                         return AssistantResponse(
-                            f"Please confirm: {unrestricted_action.description}. Type 'yes' to continue.",
+                            f"Please confirm (UNVERIFIED PATH \u2014 not in your allowlist or index): "
+                            f"{unrestricted_action.description}. Type 'yes' to continue.",
                             pending_action=unrestricted_action,
                         )
             except Exception:
@@ -2634,7 +2635,7 @@ class LocalAssistant:
             )
             
             return (
-                f"Found '{match.item.name}' ({confidence} match). "
+                f"Found '{match.item.name}' ({confidence} match, indexed). "
                 f"Would you like me to open it? (Reply 'yes')",
                 action,
             )
