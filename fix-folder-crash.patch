@@ -1,0 +1,51 @@
+diff --git a/assistant/actions.py b/assistant/actions.py
+index ba19198..210470b 100644
+--- a/assistant/actions.py
++++ b/assistant/actions.py
+@@ -104,7 +104,12 @@ def load_allowed_folders(path: str | Path = DEFAULT_FOLDERS_PATH) -> dict[str, s
+             raise ActionError("Folder names and targets must be strings.")
+         clean_name = normalize_action_text(name)
+         clean_target = normalize_folder_path(target)
+-        validate_folder_target(clean_target)
++        try:
++            validate_folder_target(clean_target)
++        except ActionError:
++            # Skip folders that don't exist on this machine (e.g. paths copied
++            # from another user's config) instead of crashing the whole load.
++            continue
+         folders[clean_name] = clean_target
+     return folders
+ 
+diff --git a/assistant/cli.py b/assistant/cli.py
+index 9136d32..739d4c1 100644
+--- a/assistant/cli.py
++++ b/assistant/cli.py
+@@ -744,7 +744,10 @@ def main() -> int:
+             alias_text = user_text
+         intent_text = normalize_intent(alias_text)
+         command_for_action = intent_text if intent_text is not None else alias_text
+-        selected_target = parse_action(command_for_action)
++        try:
++            selected_target = parse_action(command_for_action)
++        except ActionError:
++            selected_target = None
+         if voice_enabled:
+             _print_voice_debug(
+                 "routing",
+diff --git a/config/folders.json b/config/folders.json
+index b83e768..33f535b 100644
+--- a/config/folders.json
++++ b/config/folders.json
+@@ -1,9 +1,9 @@
+ {
+   "folders": {
+     "assistant folder": ".",
+-    "desktop": "C:\\Users\\GameTech\\Desktop",
+-    "documents": "C:\\Users\\GameTech\\Documents",
+-    "downloads": "C:\\Users\\GameTech\\Downloads",
++    "desktop": "%USERPROFILE%\\Desktop",
++    "documents": "%USERPROFILE%\\Documents",
++    "downloads": "%USERPROFILE%\\Downloads",
+     "project folder": "."
+   }
+ }

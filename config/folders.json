@@ -1,9 +1,9 @@
 {
   "folders": {
     "assistant folder": ".",
-    "desktop": "C:\\Users\\GameTech\\Desktop",
-    "documents": "C:\\Users\\GameTech\\Documents",
-    "downloads": "C:\\Users\\GameTech\\Downloads",
+    "desktop": "%USERPROFILE%\\Desktop",
+    "documents": "%USERPROFILE%\\Documents",
+    "downloads": "%USERPROFILE%\\Downloads",
     "project folder": "."
   }
 }

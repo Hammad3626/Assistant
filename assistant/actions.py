@@ -104,7 +104,12 @@ def load_allowed_folders(path: str | Path = DEFAULT_FOLDERS_PATH) -> dict[str, s
             raise ActionError("Folder names and targets must be strings.")
         clean_name = normalize_action_text(name)
         clean_target = normalize_folder_path(target)
-        validate_folder_target(clean_target)
+        try:
+            validate_folder_target(clean_target)
+        except ActionError:
+            # Skip folders that don't exist on this machine (e.g. paths copied
+            # from another user's config) instead of crashing the whole load.
+            continue
         folders[clean_name] = clean_target
     return folders
 

@@ -744,7 +744,10 @@ def main() -> int:
             alias_text = user_text
         intent_text = normalize_intent(alias_text)
         command_for_action = intent_text if intent_text is not None else alias_text
-        selected_target = parse_action(command_for_action)
+        try:
+            selected_target = parse_action(command_for_action)
+        except ActionError:
+            selected_target = None
         if voice_enabled:
             _print_voice_debug(
                 "routing",
