@@ -40,7 +40,7 @@ class WindowsIntegrationConfig:
     clipboard_enabled: bool = True
     minimize_to_tray: bool = False
     load_last_session: bool = True
-    check_ollama_on_startup: bool = True
+    check_ollama_on_startup: bool = False
     
     def save(self, path: Path | None = None) -> None:
         """Save configuration to file."""
@@ -73,7 +73,7 @@ class WindowsIntegrationConfig:
                 clipboard_enabled=data.get("clipboard_enabled", True),
                 minimize_to_tray=data.get("minimize_to_tray", False),
                 load_last_session=data.get("load_last_session", True),
-                check_ollama_on_startup=data.get("check_ollama_on_startup", True),
+                check_ollama_on_startup=data.get("check_ollama_on_startup", False),
             )
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(f"Could not load Windows integration config: {exc}")
@@ -355,7 +355,16 @@ def check_ollama_running() -> bool:
 
 def start_ollama_if_needed() -> bool:
     """Start Ollama if it's not already running.
-    
+
+    SAFETY NOTE: this launches a real executable (ollama.exe / `ollama serve`)
+    with NO user confirmation. It is currently only reachable through
+    startup_checks(), which is not wired into cli.py, core.py, or gui.py in
+    this build. If you wire startup_checks()/this function into the live
+    assistant flow, route it through a PendingAction confirmation first
+    (see assistant.actions / assistant.core's confirm_pending_action) rather
+    than calling it directly, to preserve the "nothing runs without
+    confirmation" policy the rest of the app follows.
+
     Returns:
         True if Ollama is running after this call, False otherwise
     """

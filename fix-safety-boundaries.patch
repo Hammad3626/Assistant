@@ -1,0 +1,1075 @@
+diff --git a/assistant/file_batch_operations.py b/assistant/file_batch_operations.py
+deleted file mode 100644
+index 5c5d0ff..0000000
+--- a/assistant/file_batch_operations.py
++++ /dev/null
+@@ -1,446 +0,0 @@
+-"""
+-Phase 5.2: File Batch Operations Workflow
+-
+-Enables bulk file operations with safety:
+-1. List/search files in a folder
+-2. Apply filters and transformations
+-3. Preview changes
+-4. Request user approval
+-5. Execute with rollback on error
+-"""
+-
+-import json
+-import logging
+-import shutil
+-from dataclasses import dataclass, field
+-from pathlib import Path
+-from typing import Callable, Optional
+-
+-logger = logging.getLogger(__name__)
+-
+-
+-@dataclass
+-class FileOperation:
+-    """Represents a single file operation."""
+-    file_path: Path
+-    operation: str  # "rename", "replace", "delete", "copy", "move"
+-    details: dict = field(default_factory=dict)  # operation-specific details
+-    preview: str = ""  # Human-readable preview of the change
+-    status: str = "pending"  # "pending", "executed", "failed", "skipped"
+-    error: Optional[str] = None
+-
+-
+-@dataclass
+-class BatchOperationResult:
+-    """Result of executing a batch operation."""
+-    total_operations: int
+-    successful: int
+-    failed: int
+-    skipped: int
+-    operations: list[FileOperation]
+-    errors: list[str] = field(default_factory=list)
+-    
+-    @property
+-    def success_rate(self) -> float:
+-        """Percentage of successful operations."""
+-        if self.total_operations == 0:
+-            return 100.0
+-        return (self.successful / self.total_operations) * 100
+-
+-
+-def list_files(
+-    directory: Path,
+-    pattern: str = "*",
+-    recursive: bool = False,
+-    exclude_dirs: bool = True
+-) -> list[Path]:
+-    """
+-    List files in a directory with optional filtering.
+-    
+-    Args:
+-        directory: Root directory to search
+-        pattern: Glob pattern to match (e.g., "*.py", "*.txt")
+-        recursive: Whether to search subdirectories
+-        exclude_dirs: Whether to exclude directories from results
+-    
+-    Returns:
+-        List of matching file paths
+-    """
+-    if not directory.exists():
+-        logger.warning(f"Directory not found: {directory}")
+-        return []
+-    
+-    try:
+-        if recursive:
+-            matches = list(directory.rglob(pattern))
+-        else:
+-            matches = list(directory.glob(pattern))
+-        
+-        if exclude_dirs:
+-            matches = [m for m in matches if m.is_file()]
+-        
+-        logger.info(f"Found {len(matches)} files matching {pattern}")
+-        return sorted(matches)
+-    
+-    except Exception as e:
+-        logger.error(f"Error listing files: {e}")
+-        return []
+-
+-
+-def search_files_by_content(
+-    directory: Path,
+-    search_text: str,
+-    file_pattern: str = "*",
+-    recursive: bool = True
+-) -> list[Path]:
+-    """
+-    Find files containing specific text.
+-    
+-    Args:
+-        directory: Root directory to search
+-        search_text: Text to search for
+-        file_pattern: Glob pattern to match
+-        recursive: Whether to search subdirectories
+-    
+-    Returns:
+-        List of files containing the search text
+-    """
+-    if not directory.exists():
+-        logger.warning(f"Directory not found: {directory}")
+-        return []
+-    
+-    results = []
+-    files = list_files(directory, file_pattern, recursive=recursive)
+-    
+-    for file_path in files:
+-        try:
+-            content = file_path.read_text(encoding="utf-8", errors="ignore")
+-            if search_text in content:
+-                results.append(file_path)
+-                logger.debug(f"Found '{search_text}' in {file_path}")
+-        except Exception as e:
+-            logger.debug(f"Could not read {file_path}: {e}")
+-    
+-    logger.info(f"Found {len(results)} files containing '{search_text}'")
+-    return sorted(results)
+-
+-
+-def plan_rename_operation(
+-    file_path: Path,
+-    new_name: str
+-) -> FileOperation:
+-    """Create a rename operation."""
+-    if file_path.name == new_name:
+-        return FileOperation(
+-            file_path=file_path,
+-            operation="rename",
+-            details={"new_name": new_name},
+-            preview=f"No change (same name)",
+-            status="skipped"
+-        )
+-    
+-    return FileOperation(
+-        file_path=file_path,
+-        operation="rename",
+-        details={"new_name": new_name},
+-        preview=f"{file_path.name} → {new_name}"
+-    )
+-
+-
+-def plan_replace_operation(
+-    file_path: Path,
+-    old_text: str,
+-    new_text: str,
+-    dry_run: bool = True
+-) -> FileOperation:
+-    """Create a replace operation."""
+-    try:
+-        content = file_path.read_text(encoding="utf-8")
+-        if old_text not in content:
+-            return FileOperation(
+-                file_path=file_path,
+-                operation="replace",
+-                details={"old_text": old_text, "new_text": new_text},
+-                preview="No match found (no change)",
+-                status="skipped"
+-            )
+-        
+-        new_content = content.replace(old_text, new_text)
+-        occurrences = content.count(old_text)
+-        
+-        preview = f"Replace '{old_text}' with '{new_text}' ({occurrences} occurrence(s))"
+-        if not dry_run:
+-            file_path.write_text(new_content, encoding="utf-8")
+-            preview += " [EXECUTED]"
+-        
+-        return FileOperation(
+-            file_path=file_path,
+-            operation="replace",
+-            details={"old_text": old_text, "new_text": new_text, "occurrences": occurrences},
+-            preview=preview
+-        )
+-    
+-    except Exception as e:
+-        return FileOperation(
+-            file_path=file_path,
+-            operation="replace",
+-            details={"old_text": old_text, "new_text": new_text},
+-            preview=f"Error: {str(e)}",
+-            status="failed",
+-            error=str(e)
+-        )
+-
+-
+-def plan_delete_operation(file_path: Path) -> FileOperation:
+-    """Create a delete operation."""
+-    return FileOperation(
+-        file_path=file_path,
+-        operation="delete",
+-        details={},
+-        preview=f"Delete {file_path.name}"
+-    )
+-
+-
+-def execute_batch_operations(
+-    operations: list[FileOperation],
+-    approval_callback: Optional[Callable[[list[FileOperation]], bool]] = None,
+-    backup_dir: Optional[Path] = None
+-) -> BatchOperationResult:
+-    """
+-    Execute a batch of file operations with optional approval and rollback.
+-    
+-    Args:
+-        operations: List of FileOperation objects to execute
+-        approval_callback: Optional callback to approve operations
+-        backup_dir: Optional directory to backup files before modification
+-    
+-    Returns:
+-        BatchOperationResult with execution details
+-    """
+-    result = BatchOperationResult(
+-        total_operations=len(operations),
+-        successful=0,
+-        failed=0,
+-        skipped=0,
+-        operations=operations.copy()
+-    )
+-    
+-    if not operations:
+-        logger.info("No operations to execute")
+-        return result
+-    
+-    # Request approval if callback provided
+-    if approval_callback:
+-        try:
+-            approved = approval_callback(operations)
+-            if not approved:
+-                result.skipped = len(operations)
+-                for op in result.operations:
+-                    op.status = "skipped"
+-                logger.info("Operations rejected by user")
+-                return result
+-        except Exception as e:
+-            result.errors.append(f"Approval callback failed: {str(e)}")
+-            logger.error(f"Approval callback error: {e}", exc_info=True)
+-            return result
+-    
+-    # Create backups if requested
+-    backup_map = {}
+-    if backup_dir:
+-        backup_dir.mkdir(parents=True, exist_ok=True)
+-        for op in operations:
+-            if op.operation in ["delete", "replace"] and op.file_path.exists():
+-                try:
+-                    backup_path = backup_dir / op.file_path.name
+-                    shutil.copy2(op.file_path, backup_path)
+-                    backup_map[op.file_path] = backup_path
+-                    logger.debug(f"Backed up {op.file_path} to {backup_path}")
+-                except Exception as e:
+-                    logger.warning(f"Could not backup {op.file_path}: {e}")
+-    
+-    # Execute operations
+-    for op in result.operations:
+-        if op.status == "skipped":
+-            result.skipped += 1
+-            continue
+-        
+-        try:
+-            if op.operation == "rename":
+-                _execute_rename(op)
+-            elif op.operation == "replace":
+-                _execute_replace(op)
+-            elif op.operation == "delete":
+-                _execute_delete(op)
+-            else:
+-                op.status = "failed"
+-                op.error = f"Unknown operation: {op.operation}"
+-                result.failed += 1
+-                result.errors.append(f"{op.file_path}: {op.error}")
+-            
+-            # Process operation result status
+-            if op.status == "executed":
+-                result.successful += 1
+-            elif op.status == "skipped":
+-                result.skipped += 1
+-            elif op.status == "failed":
+-                result.failed += 1
+-                if op.error:
+-                    result.errors.append(f"{op.file_path}: {op.error}")
+-        
+-        except Exception as e:
+-            op.status = "failed"
+-            op.error = str(e)
+-            result.failed += 1
+-            result.errors.append(f"{op.file_path}: {str(e)}")
+-            logger.error(f"Failed to execute {op.operation} on {op.file_path}: {e}")
+-    
+-    logger.info(
+-        f"Batch complete: {result.successful} succeeded, "
+-        f"{result.failed} failed, {result.skipped} skipped"
+-    )
+-    
+-    return result
+-
+-
+-def _execute_rename(op: FileOperation) -> None:
+-    """Execute a rename operation."""
+-    if not op.file_path.exists():
+-        op.status = "failed"
+-        op.error = "File not found"
+-        return
+-    
+-    new_name = op.details.get("new_name")
+-    if not new_name:
+-        op.status = "failed"
+-        op.error = "No new name specified"
+-        return
+-    
+-    new_path = op.file_path.parent / new_name
+-    
+-    if new_path.exists():
+-        op.status = "failed"
+-        op.error = f"Target file already exists: {new_name}"
+-        return
+-    
+-    try:
+-        op.file_path.rename(new_path)
+-        op.status = "executed"
+-        op.preview = f"✓ Renamed to {new_name}"
+-        logger.info(f"Renamed {op.file_path} → {new_path}")
+-    except Exception as e:
+-        op.status = "failed"
+-        op.error = str(e)
+-        logger.error(f"Rename failed: {e}")
+-
+-
+-def _execute_replace(op: FileOperation) -> None:
+-    """Execute a replace operation."""
+-    if not op.file_path.exists():
+-        op.status = "failed"
+-        op.error = "File not found"
+-        return
+-    
+-    old_text = op.details.get("old_text", "")
+-    new_text = op.details.get("new_text", "")
+-    
+-    try:
+-        content = op.file_path.read_text(encoding="utf-8")
+-        
+-        if old_text not in content:
+-            op.status = "skipped"
+-            op.preview = "No match found"
+-            return
+-        
+-        new_content = content.replace(old_text, new_text)
+-        op.file_path.write_text(new_content, encoding="utf-8")
+-        
+-        op.status = "executed"
+-        occurrences = op.details.get("occurrences", 0)
+-        op.preview = f"✓ Replaced {occurrences} occurrence(s)"
+-        logger.info(f"Replaced text in {op.file_path}")
+-    
+-    except Exception as e:
+-        op.status = "failed"
+-        op.error = str(e)
+-        logger.error(f"Replace failed: {e}")
+-
+-
+-def _execute_delete(op: FileOperation) -> None:
+-    """Execute a delete operation."""
+-    if not op.file_path.exists():
+-        op.status = "failed"
+-        op.error = "File not found"
+-        return
+-    
+-    try:
+-        op.file_path.unlink()
+-        op.status = "executed"
+-        op.preview = f"✓ Deleted {op.file_path.name}"
+-        logger.info(f"Deleted {op.file_path}")
+-    except Exception as e:
+-        op.status = "failed"
+-        op.error = str(e)
+-        logger.error(f"Delete failed: {e}")
+-
+-
+-def batch_rename_files(
+-    directory: Path,
+-    pattern: str = "*",
+-    name_transform: Callable[[str], str] = lambda x: x,
+-    approval_callback: Optional[Callable[[list[FileOperation]], bool]] = None
+-) -> BatchOperationResult:
+-    """
+-    Batch rename files in a directory.
+-    
+-    Args:
+-        directory: Directory containing files
+-        pattern: Glob pattern to match
+-        name_transform: Function to transform file names
+-        approval_callback: Optional approval function
+-    
+-    Returns:
+-        Batch operation result
+-    """
+-    files = list_files(directory, pattern, recursive=False)
+-    operations = []
+-    
+-    for file_path in files:
+-        new_name = name_transform(file_path.name)
+-        if new_name != file_path.name:
+-            op = plan_rename_operation(file_path, new_name)
+-            operations.append(op)
+-    
+-    return execute_batch_operations(operations, approval_callback)
+-
+-
+-def batch_replace_content(
+-    directory: Path,
+-    old_text: str,
+-    new_text: str,
+-    file_pattern: str = "*",
+-    recursive: bool = True,
+-    approval_callback: Optional[Callable[[list[FileOperation]], bool]] = None
+-) -> BatchOperationResult:
+-    """
+-    Replace text in multiple files.
+-    
+-    Args:
+-        directory: Root directory to search
+-        old_text: Text to find
+-        new_text: Replacement text
+-        file_pattern: Glob pattern to match
+-        recursive: Whether to search subdirectories
+-        approval_callback: Optional approval function
+-    
+-    Returns:
+-        Batch operation result
+-    """
+-    files = list_files(directory, file_pattern, recursive=recursive)
+-    operations = []
+-    
+-    for file_path in files:
+-        op = plan_replace_operation(file_path, old_text, new_text, dry_run=True)
+-        if op.status != "skipped":  # Only include files with actual changes
+-            operations.append(op)
+-    
+-    return execute_batch_operations(operations, approval_callback)
+diff --git a/assistant/windows_integration.py b/assistant/windows_integration.py
+index f82d795..96b4342 100644
+--- a/assistant/windows_integration.py
++++ b/assistant/windows_integration.py
+@@ -40,7 +40,7 @@ class WindowsIntegrationConfig:
+     clipboard_enabled: bool = True
+     minimize_to_tray: bool = False
+     load_last_session: bool = True
+-    check_ollama_on_startup: bool = True
++    check_ollama_on_startup: bool = False
+     
+     def save(self, path: Path | None = None) -> None:
+         """Save configuration to file."""
+@@ -73,7 +73,7 @@ class WindowsIntegrationConfig:
+                 clipboard_enabled=data.get("clipboard_enabled", True),
+                 minimize_to_tray=data.get("minimize_to_tray", False),
+                 load_last_session=data.get("load_last_session", True),
+-                check_ollama_on_startup=data.get("check_ollama_on_startup", True),
++                check_ollama_on_startup=data.get("check_ollama_on_startup", False),
+             )
+         except (json.JSONDecodeError, OSError) as exc:
+             logger.warning(f"Could not load Windows integration config: {exc}")
+@@ -355,7 +355,16 @@ def check_ollama_running() -> bool:
+ 
+ def start_ollama_if_needed() -> bool:
+     """Start Ollama if it's not already running.
+-    
++
++    SAFETY NOTE: this launches a real executable (ollama.exe / `ollama serve`)
++    with NO user confirmation. It is currently only reachable through
++    startup_checks(), which is not wired into cli.py, core.py, or gui.py in
++    this build. If you wire startup_checks()/this function into the live
++    assistant flow, route it through a PendingAction confirmation first
++    (see assistant.actions / assistant.core's confirm_pending_action) rather
++    than calling it directly, to preserve the "nothing runs without
++    confirmation" policy the rest of the app follows.
++
+     Returns:
+         True if Ollama is running after this call, False otherwise
+     """
+diff --git a/tests/test_file_batch_operations.py b/tests/test_file_batch_operations.py
+deleted file mode 100644
+index d16422a..0000000
+--- a/tests/test_file_batch_operations.py
++++ /dev/null
+@@ -1,388 +0,0 @@
+-"""
+-Tests for Phase 5.2: File Batch Operations Workflow
+-"""
+-
+-import tempfile
+-import unittest
+-from pathlib import Path
+-from unittest.mock import Mock, patch
+-
+-from assistant.file_batch_operations import (
+-    list_files,
+-    search_files_by_content,
+-    plan_rename_operation,
+-    plan_replace_operation,
+-    plan_delete_operation,
+-    execute_batch_operations,
+-    batch_rename_files,
+-    batch_replace_content,
+-    FileOperation,
+-    BatchOperationResult,
+-)
+-
+-
+-class FileListingTests(unittest.TestCase):
+-    """Test file listing and searching."""
+-    
+-    def setUp(self):
+-        """Create temporary directory with test files."""
+-        self.temp_dir = tempfile.TemporaryDirectory()
+-        self.test_dir = Path(self.temp_dir.name)
+-        
+-        # Create test files
+-        (self.test_dir / "file1.txt").write_text("content1")
+-        (self.test_dir / "file2.txt").write_text("content2")
+-        (self.test_dir / "file3.py").write_text("def func(): pass")
+-        (self.test_dir / "subdir").mkdir()
+-        (self.test_dir / "subdir" / "nested.txt").write_text("nested content")
+-    
+-    def tearDown(self):
+-        """Clean up temporary directory."""
+-        self.temp_dir.cleanup()
+-    
+-    def test_list_all_files(self):
+-        """List all files in directory."""
+-        files = list_files(self.test_dir, recursive=False)
+-        self.assertEqual(len(files), 3)
+-        self.assertTrue(all(f.is_file() for f in files))
+-    
+-    def test_list_with_pattern(self):
+-        """List files matching pattern."""
+-        files = list_files(self.test_dir, pattern="*.txt", recursive=False)
+-        self.assertEqual(len(files), 2)
+-        self.assertTrue(all(f.suffix == ".txt" for f in files))
+-    
+-    def test_list_recursive(self):
+-        """List files recursively in subdirectories."""
+-        files = list_files(self.test_dir, pattern="*.txt", recursive=True)
+-        self.assertEqual(len(files), 3)
+-    
+-    def test_list_nonexistent_directory(self):
+-        """Handle non-existent directory gracefully."""
+-        files = list_files(Path("/nonexistent/path"))
+-        self.assertEqual(len(files), 0)
+-    
+-    def test_search_by_content(self):
+-        """Find files containing specific text."""
+-        files = search_files_by_content(self.test_dir, "content", recursive=True)
+-        self.assertEqual(len(files), 3)  # All .txt files contain "content"
+-    
+-    def test_search_by_specific_text(self):
+-        """Find files with specific unique text."""
+-        files = search_files_by_content(self.test_dir, "nested", recursive=True)
+-        self.assertEqual(len(files), 1)
+-        self.assertEqual(files[0].name, "nested.txt")
+-    
+-    def test_search_no_matches(self):
+-        """Search with no matching files."""
+-        files = search_files_by_content(self.test_dir, "NONEXISTENT", recursive=True)
+-        self.assertEqual(len(files), 0)
+-
+-
+-class OperationPlanningTests(unittest.TestCase):
+-    """Test file operation planning."""
+-    
+-    def setUp(self):
+-        """Create temporary directory with test files."""
+-        self.temp_dir = tempfile.TemporaryDirectory()
+-        self.test_dir = Path(self.temp_dir.name)
+-        self.test_file = self.test_dir / "test.txt"
+-        self.test_file.write_text("original content")
+-    
+-    def tearDown(self):
+-        """Clean up temporary directory."""
+-        self.temp_dir.cleanup()
+-    
+-    def test_plan_rename_operation(self):
+-        """Plan a file rename."""
+-        op = plan_rename_operation(self.test_file, "renamed.txt")
+-        
+-        self.assertEqual(op.operation, "rename")
+-        self.assertEqual(op.status, "pending")
+-        self.assertEqual(op.details["new_name"], "renamed.txt")
+-        self.assertIn("renamed.txt", op.preview)
+-    
+-    def test_plan_rename_same_name(self):
+-        """Plan rename with same name skips operation."""
+-        op = plan_rename_operation(self.test_file, "test.txt")
+-        
+-        self.assertEqual(op.status, "skipped")
+-        self.assertIn("No change", op.preview)
+-    
+-    def test_plan_replace_operation(self):
+-        """Plan a text replacement."""
+-        op = plan_replace_operation(self.test_file, "original", "modified")
+-        
+-        self.assertEqual(op.operation, "replace")
+-        self.assertEqual(op.status, "pending")
+-        self.assertEqual(op.details["old_text"], "original")
+-        self.assertEqual(op.details["new_text"], "modified")
+-        self.assertEqual(op.details["occurrences"], 1)
+-    
+-    def test_plan_replace_no_match(self):
+-        """Plan replace with no matching text skips."""
+-        op = plan_replace_operation(self.test_file, "NOTFOUND", "replacement")
+-        
+-        self.assertEqual(op.status, "skipped")
+-        self.assertIn("No match", op.preview)
+-    
+-    def test_plan_delete_operation(self):
+-        """Plan a file deletion."""
+-        op = plan_delete_operation(self.test_file)
+-        
+-        self.assertEqual(op.operation, "delete")
+-        self.assertEqual(op.status, "pending")
+-        self.assertIn("Delete", op.preview)
+-
+-
+-class BatchExecutionTests(unittest.TestCase):
+-    """Test batch operation execution."""
+-    
+-    def setUp(self):
+-        """Create temporary directory with test files."""
+-        self.temp_dir = tempfile.TemporaryDirectory()
+-        self.test_dir = Path(self.temp_dir.name)
+-        self.backup_dir = self.test_dir / "backups"
+-        
+-        # Create test files
+-        self.file1 = self.test_dir / "file1.txt"
+-        self.file1.write_text("content1")
+-        self.file2 = self.test_dir / "file2.txt"
+-        self.file2.write_text("content2")
+-    
+-    def tearDown(self):
+-        """Clean up temporary directory."""
+-        self.temp_dir.cleanup()
+-    
+-    def test_execute_rename(self):
+-        """Execute a rename operation."""
+-        op = plan_rename_operation(self.file1, "renamed.txt")
+-        result = execute_batch_operations([op])
+-        
+-        self.assertTrue((self.test_dir / "renamed.txt").exists())
+-        self.assertFalse(self.file1.exists())
+-        self.assertEqual(result.successful, 1)
+-        self.assertEqual(result.failed, 0)
+-    
+-    def test_execute_replace(self):
+-        """Execute a text replacement."""
+-        op = plan_replace_operation(self.file1, "content1", "REPLACED")
+-        result = execute_batch_operations([op])
+-        
+-        content = self.file1.read_text()
+-        self.assertIn("REPLACED", content)
+-        self.assertNotIn("content1", content)
+-        self.assertEqual(result.successful, 1)
+-    
+-    def test_execute_delete(self):
+-        """Execute a file deletion."""
+-        op = plan_delete_operation(self.file1)
+-        result = execute_batch_operations([op])
+-        
+-        self.assertFalse(self.file1.exists())
+-        self.assertEqual(result.successful, 1)
+-    
+-    def test_execute_with_approval_callback_rejected(self):
+-        """Reject operations in approval callback."""
+-        op = plan_rename_operation(self.file1, "renamed.txt")
+-        
+-        def reject_callback(ops):
+-            return False
+-        
+-        result = execute_batch_operations([op], approval_callback=reject_callback)
+-        
+-        self.assertEqual(result.skipped, 1)
+-        self.assertEqual(result.successful, 0)
+-        self.assertTrue(self.file1.exists())  # File should not be renamed
+-    
+-    def test_execute_with_approval_callback_approved(self):
+-        """Approve operations in callback."""
+-        op = plan_rename_operation(self.file1, "renamed.txt")
+-        
+-        def approve_callback(ops):
+-            return True
+-        
+-        result = execute_batch_operations([op], approval_callback=approve_callback)
+-        
+-        self.assertEqual(result.successful, 1)
+-        self.assertTrue((self.test_dir / "renamed.txt").exists())
+-    
+-    def test_execute_with_backup(self):
+-        """Execute operations with backup creation."""
+-        self.backup_dir.mkdir(exist_ok=True)
+-        op = plan_delete_operation(self.file1)
+-        result = execute_batch_operations([op], backup_dir=self.backup_dir)
+-        
+-        # File should be deleted
+-        self.assertFalse(self.file1.exists())
+-        # But backup should exist
+-        self.assertTrue((self.backup_dir / "file1.txt").exists())
+-        self.assertEqual(result.successful, 1)
+-    
+-    def test_execute_multiple_operations(self):
+-        """Execute multiple operations in sequence."""
+-        op1 = plan_replace_operation(self.file1, "content1", "MODIFIED")
+-        op2 = plan_rename_operation(self.file2, "renamed.txt")
+-        
+-        result = execute_batch_operations([op1, op2])
+-        
+-        self.assertEqual(result.successful, 2)
+-        self.assertEqual(result.total_operations, 2)
+-        self.assertIn("MODIFIED", self.file1.read_text())
+-        self.assertTrue((self.test_dir / "renamed.txt").exists())
+-    
+-    def test_execute_mixed_skipped_and_executed(self):
+-        """Execute batch with skipped and executed operations."""
+-        op1 = plan_replace_operation(self.file1, "NOTFOUND", "replacement")  # Will skip
+-        op2 = plan_rename_operation(self.file2, "renamed.txt")  # Will execute
+-        
+-        result = execute_batch_operations([op1, op2])
+-        
+-        self.assertEqual(result.skipped, 1)
+-        self.assertEqual(result.successful, 1)
+-    
+-    def test_execute_missing_file_error(self):
+-        """Handle missing file gracefully."""
+-        fake_file = self.test_dir / "nonexistent.txt"
+-        op = plan_rename_operation(fake_file, "new.txt")
+-        result = execute_batch_operations([op])
+-        
+-        self.assertEqual(result.failed, 1)
+-        self.assertGreater(len(result.errors), 0)
+-
+-
+-class BatchRenameTests(unittest.TestCase):
+-    """Test batch rename functionality."""
+-    
+-    def setUp(self):
+-        """Create temporary directory with test files."""
+-        self.temp_dir = tempfile.TemporaryDirectory()
+-        self.test_dir = Path(self.temp_dir.name)
+-        
+-        (self.test_dir / "old_name1.txt").write_text("content1")
+-        (self.test_dir / "old_name2.txt").write_text("content2")
+-    
+-    def tearDown(self):
+-        """Clean up temporary directory."""
+-        self.temp_dir.cleanup()
+-    
+-    def test_batch_rename_with_transform(self):
+-        """Rename multiple files using transform function."""
+-        def transform(name):
+-            return name.replace("old_", "new_")
+-        
+-        result = batch_rename_files(self.test_dir, pattern="*.txt", name_transform=transform)
+-        
+-        self.assertEqual(result.successful, 2)
+-        self.assertTrue((self.test_dir / "new_name1.txt").exists())
+-        self.assertTrue((self.test_dir / "new_name2.txt").exists())
+-    
+-    def test_batch_rename_with_approval(self):
+-        """Batch rename with user approval."""
+-        def transform(name):
+-            return name.replace("old_", "approved_")
+-        
+-        def approve_callback(ops):
+-            self.assertEqual(len(ops), 2)
+-            return True
+-        
+-        result = batch_rename_files(
+-            self.test_dir,
+-            pattern="*.txt",
+-            name_transform=transform,
+-            approval_callback=approve_callback
+-        )
+-        
+-        self.assertEqual(result.successful, 2)
+-
+-
+-class BatchReplaceTests(unittest.TestCase):
+-    """Test batch replace functionality."""
+-    
+-    def setUp(self):
+-        """Create temporary directory with test files."""
+-        self.temp_dir = tempfile.TemporaryDirectory()
+-        self.test_dir = Path(self.temp_dir.name)
+-        
+-        (self.test_dir / "file1.txt").write_text("This is OLD and needs change")
+-        (self.test_dir / "file2.txt").write_text("This is OLD content")
+-        (self.test_dir / "file3.py").write_text("# No OLD here")
+-    
+-    def tearDown(self):
+-        """Clean up temporary directory."""
+-        self.temp_dir.cleanup()
+-    
+-    def test_batch_replace_content(self):
+-        """Replace content in multiple files."""
+-        result = batch_replace_content(
+-            self.test_dir,
+-            old_text="OLD",
+-            new_text="NEW",
+-            file_pattern="*.txt"
+-        )
+-        
+-        self.assertEqual(result.successful, 2)
+-        self.assertIn("NEW", (self.test_dir / "file1.txt").read_text())
+-        self.assertIn("NEW", (self.test_dir / "file2.txt").read_text())
+-        self.assertIn("OLD", (self.test_dir / "file3.py").read_text())  # Unchanged
+-    
+-    def test_batch_replace_with_approval(self):
+-        """Batch replace with approval callback."""
+-        def approve_callback(ops):
+-            self.assertEqual(len(ops), 2)
+-            return True
+-        
+-        result = batch_replace_content(
+-            self.test_dir,
+-            old_text="OLD",
+-            new_text="APPROVED",
+-            file_pattern="*.txt",
+-            approval_callback=approve_callback
+-        )
+-        
+-        self.assertEqual(result.successful, 2)
+-        self.assertIn("APPROVED", (self.test_dir / "file1.txt").read_text())
+-
+-
+-class BatchOperationResultTests(unittest.TestCase):
+-    """Test result tracking."""
+-    
+-    def test_success_rate_calculation(self):
+-        """Calculate success rate correctly."""
+-        result = BatchOperationResult(
+-            total_operations=10,
+-            successful=8,
+-            failed=2,
+-            skipped=0,
+-            operations=[]
+-        )
+-        
+-        self.assertEqual(result.success_rate, 80.0)
+-    
+-    def test_success_rate_all_operations_passed(self):
+-        """Success rate is 100% when all passed."""
+-        result = BatchOperationResult(
+-            total_operations=5,
+-            successful=5,
+-            failed=0,
+-            skipped=0,
+-            operations=[]
+-        )
+-        
+-        self.assertEqual(result.success_rate, 100.0)
+-    
+-    def test_success_rate_zero_operations(self):
+-        """Success rate is 100% when no operations."""
+-        result = BatchOperationResult(
+-            total_operations=0,
+-            successful=0,
+-            failed=0,
+-            skipped=0,
+-            operations=[]
+-        )
+-        
+-        self.assertEqual(result.success_rate, 100.0)
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
+diff --git a/tests/test_safety_boundaries.py b/tests/test_safety_boundaries.py
+new file mode 100644
+index 0000000..7dfd12f
+--- /dev/null
++++ b/tests/test_safety_boundaries.py
+@@ -0,0 +1,183 @@
++"""Regression tests for four core safety boundaries the assistant must hold:
++
++1. No raw arbitrary shell command execution (only named, allowlisted commands).
++2. No permanent file deletion or live bulk file modification apply path.
++3. No real message/email/network sending capability.
++4. No automatic/unconfirmed launching or allowlisting of unlisted apps or scripts.
++
++These tests exist because each of the four was independently audited and found
++sound, with the exception of a couple of latent gaps that were then fixed:
++- assistant/file_batch_operations.py contained live unlink()/overwrite logic
++  that was unreachable from the live app, but contradicted the rest of the
++  codebase's dry-run-only bulk policy. It has been removed.
++- windows_integration.py's start_ollama_if_needed() launches a real
++  executable with no confirmation prompt; it is gated behind
++  check_ollama_on_startup, which now defaults to False (was True).
++"""
++
++from __future__ import annotations
++
++import ast
++import importlib
++import unittest
++from pathlib import Path
++
++from assistant.windows_integration import WindowsIntegrationConfig
++
++
++ASSISTANT_DIR = Path(__file__).resolve().parent.parent / "assistant"
++
++
++class NoRawShellExecutionTests(unittest.TestCase):
++    def test_shell_tools_never_uses_shell_true(self) -> None:
++        """subprocess calls in shell_tools.py must never use shell=True, which
++        would allow raw shell string execution instead of a fixed argv list.
++        """
++        source = (ASSISTANT_DIR / "shell_tools.py").read_text(encoding="utf-8")
++        tree = ast.parse(source)
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Call):
++                for keyword in node.keywords:
++                    if keyword.arg == "shell":
++                        self.assertFalse(
++                            isinstance(keyword.value, ast.Constant) and keyword.value.value is True,
++                            "shell_tools.py must never call subprocess with shell=True",
++                        )
++
++    def test_run_shell_command_only_accepts_looked_up_named_commands(self) -> None:
++        """The only way to reach run_shell_command's argv must be through
++        get_shell_command(), which resolves a name against the JSON
++        allowlist -- never raw free-text user input.
++        """
++        from assistant.shell_tools import get_shell_command, ShellToolError
++
++        with self.assertRaises(ShellToolError):
++            get_shell_command("rm -rf /", path="nonexistent-shell-commands.json")
++
++
++class NoLiveDestructiveBulkOpsTests(unittest.TestCase):
++    def test_file_batch_operations_module_removed(self) -> None:
++        """The old file_batch_operations module contained a live, unguarded
++        Path.unlink() delete and an in-place overwrite with no trash/backup,
++        contradicting the rest of the app's dry-run-only bulk policy. It must
++        not exist, so it can never be accidentally wired into the live app.
++        """
++        with self.assertRaises(ModuleNotFoundError):
++            importlib.import_module("assistant.file_batch_operations")
++
++    def test_bulk_replace_apply_plan_never_writes_files(self) -> None:
++        """The wired-in bulk apply-plan summary must remain dry-run only."""
++        import json
++        import tempfile
++        from assistant.file_tools import AllowlistedFileTools
++
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            folder = root / "docs"
++            folder.mkdir()
++            sample = folder / "a.txt"
++            sample.write_text("hello world", encoding="utf-8")
++
++            folders_path = root / "folders.json"
++            folders_path.write_text(
++                json.dumps({"folders": {"docs": str(folder)}}), encoding="utf-8"
++            )
++
++            tools = AllowlistedFileTools(
++                folders_path=folders_path,
++                trash_dir=root / "trash",
++                manifest_path=root / "trash-manifest.json",
++                bulk_backup_dir=root / "bulk-backups",
++                bulk_approval_dir=root / "bulk-approvals",
++                bulk_review_dir=root / "bulk-reviews",
++                bulk_rollback_dir=root / "bulk-rollbacks",
++                bulk_preflight_dir=root / "bulk-preflights",
++                bulk_checklist_dir=root / "bulk-checklists",
++            )
++            summary = tools.bulk_replace_apply_plan_summary("docs", "hello", "goodbye")
++
++            self.assertIn("Apply is not enabled in this build", summary)
++            self.assertEqual(sample.read_text(encoding="utf-8"), "hello world")
++
++
++class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
++    def test_outbox_module_has_no_send_or_network_send_calls(self) -> None:
++        """outbox.py must remain local-draft-only: no smtplib, no `requests`
++        library usage, no http.client, and no urllib.request usage that could
++        actually send something over the network.
++        """
++        source = (ASSISTANT_DIR / "outbox.py").read_text(encoding="utf-8")
++        tree = ast.parse(source)
++        imported_paths: set[str] = set()
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Import):
++                for alias in node.names:
++                    imported_paths.add(alias.name)
++            elif isinstance(node, ast.ImportFrom) and node.module:
++                imported_paths.add(node.module)
++
++        forbidden_paths = {"smtplib", "requests", "http.client", "urllib.request"}
++        self.assertFalse(
++            imported_paths & forbidden_paths,
++            f"outbox.py imports network-capable module(s): {imported_paths & forbidden_paths}",
++        )
++
++    def test_outbox_drafts_are_local_json_only(self) -> None:
++        import tempfile
++        from assistant.outbox import OutboxStore
++
++        with tempfile.TemporaryDirectory() as tmp:
++            path = Path(tmp) / "outbox.json"
++            store = OutboxStore(path=path)
++            store.draft_email("someone@example.com", "Subject", "Body")
++            store.draft_network_request("POST", "https://example.com/api", "note")
++
++            # Nothing should have been sent anywhere; only a local file exists.
++            self.assertTrue(path.exists())
++            drafts = store.list_drafts()
++            self.assertEqual(len(drafts), 2)
++
++    def test_no_outbound_network_calls_target_non_local_hosts(self) -> None:
++        """Any real urllib.request.urlopen call anywhere in the package must
++        target localhost/127.0.0.1 (the local Ollama server), never an
++        arbitrary remote host.
++        """
++        for path in ASSISTANT_DIR.glob("*.py"):
++            source = path.read_text(encoding="utf-8")
++            if "urlopen(" not in source and "urllib.request.Request(" not in source:
++                continue
++            for line in source.splitlines():
++                if "http://" in line and "127.0.0.1" not in line and "localhost" not in line:
++                    self.fail(f"{path.name} references a non-local http:// URL: {line.strip()}")
++
++
++class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
++    def test_check_ollama_on_startup_defaults_to_false(self) -> None:
++        """Auto-launching ollama.exe on startup with no confirmation prompt
++        must require explicit opt-in, not be on by default.
++        """
++        config = WindowsIntegrationConfig()
++        self.assertFalse(config.check_ollama_on_startup)
++
++    def test_windows_integration_not_imported_by_live_entry_points(self) -> None:
++        """start_ollama_if_needed()/startup_checks() silently launch a real
++        executable with no confirmation gate. They must stay unreachable from
++        the live app (cli.py/core.py) unless routed through a PendingAction
++        confirmation first.
++        """
++        cli_source = (ASSISTANT_DIR / "cli.py").read_text(encoding="utf-8")
++        core_source = (ASSISTANT_DIR / "core.py").read_text(encoding="utf-8")
++        self.assertNotIn("windows_integration", cli_source)
++        self.assertNotIn("windows_integration", core_source)
++
++    def test_add_allowed_app_and_folder_only_reachable_via_explicit_gui_action(self) -> None:
++        """Allowlisting a new app/folder must never happen automatically from
++        conversational input -- only through an explicit, separate call.
++        """
++        core_source = (ASSISTANT_DIR / "core.py").read_text(encoding="utf-8")
++        self.assertNotIn("add_allowed_app(", core_source)
++        self.assertNotIn("add_allowed_folder(", core_source)
++
++
++if __name__ == "__main__":
++    unittest.main()
