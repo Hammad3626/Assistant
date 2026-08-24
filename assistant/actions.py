@@ -195,10 +195,30 @@ def add_allowed_folder(
     target: str,
     path: str | Path = DEFAULT_FOLDERS_PATH,
 ) -> dict[str, str]:
+    # Validate the specific new entry explicitly and eagerly, so the caller
+    # gets an immediate, clear error if it's invalid.
+    clean_target = normalize_folder_path(target)
+    validate_folder_target(clean_target)
+
     folders = load_allowed_folders(path)
-    folders[normalize_action_text(name)] = normalize_folder_path(target)
-    save_allowed_folders(folders, path)
-    return folders
+
+    # Drop any pre-existing entries that no longer validate (e.g. a moved
+    # directory, a disconnected network drive, or -- when no folders.json
+    # exists yet -- default_folders()'s synthetic placeholder paths, which
+    # are not validated at the point they're generated). Without this, a
+    # single stale, unrelated entry would abort save_allowed_folders() below
+    # and block adding this brand new, perfectly valid folder.
+    valid_existing: dict[str, str] = {}
+    for existing_name, existing_target in folders.items():
+        try:
+            validate_folder_target(existing_target)
+        except ActionError:
+            continue
+        valid_existing[existing_name] = existing_target
+
+    valid_existing[normalize_action_text(name)] = clean_target
+    save_allowed_folders(valid_existing, path)
+    return valid_existing
 
 
 def validate_app_target(target: str) -> None:

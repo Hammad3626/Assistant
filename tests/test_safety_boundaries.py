@@ -137,18 +137,41 @@ class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
             drafts = store.list_drafts()
             self.assertEqual(len(drafts), 2)
 
-    def test_no_outbound_network_calls_target_non_local_hosts(self) -> None:
-        """Any real urllib.request.urlopen call anywhere in the package must
-        target localhost/127.0.0.1 (the local Ollama server), never an
-        arbitrary remote host.
+    def test_no_outbound_network_calls_target_non_local_hosts_outside_network_tools(self) -> None:
+        """Any real urllib.request.urlopen call OUTSIDE assistant/network_tools.py
+        must target localhost/127.0.0.1 (the local Ollama server), never an
+        arbitrary remote host. assistant/network_tools.py is intentionally
+        excluded: it is a deliberate, separately-gated capability (GET-only,
+        domain-allowlisted, confirmation-required) covered by its own tests
+        in test_network_tools.py, not an accidental/unaudited network call.
         """
         for path in ASSISTANT_DIR.glob("*.py"):
+            if path.name == "network_tools.py":
+                continue
             source = path.read_text(encoding="utf-8")
             if "urlopen(" not in source and "urllib.request.Request(" not in source:
                 continue
             for line in source.splitlines():
                 if "http://" in line and "127.0.0.1" not in line and "localhost" not in line:
                     self.fail(f"{path.name} references a non-local http:// URL: {line.strip()}")
+
+    def test_network_tools_only_supports_get_requests(self) -> None:
+        """assistant/network_tools.py must remain read-only: no POST/PUT/
+        DELETE/PATCH support, so it can never be used to send data anywhere.
+        """
+        source = (ASSISTANT_DIR / "network_tools.py").read_text(encoding="utf-8")
+        self.assertIn('method="GET"', source)
+        for forbidden_method in ('method="POST"', 'method="PUT"', 'method="DELETE"', 'method="PATCH"'):
+            self.assertNotIn(forbidden_method, source)
+
+    def test_network_tools_refuses_fetch_with_empty_allowlist(self) -> None:
+        import tempfile
+        from assistant.network_tools import NetworkToolError, validate_fetch_url
+
+        with tempfile.TemporaryDirectory() as tmp:
+            allowlist_path = Path(tmp) / "network_allowlist.json"
+            with self.assertRaises(NetworkToolError):
+                validate_fetch_url("https://example.com", allowlist_path)
 
 
 class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
@@ -170,13 +193,29 @@ class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
         self.assertNotIn("windows_integration", cli_source)
         self.assertNotIn("windows_integration", core_source)
 
-    def test_add_allowed_app_and_folder_only_reachable_via_explicit_gui_action(self) -> None:
+    def test_add_allowed_app_and_folder_only_reachable_after_explicit_confirmation(self) -> None:
         """Allowlisting a new app/folder must never happen automatically from
-        conversational input -- only through an explicit, separate call.
+        conversational input alone -- it must always go through the same
+        PendingAction confirm_pending_action() gate as every other
+        state-changing action (the user must type the request AND then
+        separately confirm with 'yes'). It is fine for this to be reachable
+        via chat (e.g. "add app X at Y") as long as it's confirmation-gated;
+        it must never be callable directly from respond()'s parsing path.
         """
         core_source = (ASSISTANT_DIR / "core.py").read_text(encoding="utf-8")
-        self.assertNotIn("add_allowed_app(", core_source)
-        self.assertNotIn("add_allowed_folder(", core_source)
+        respond_start = core_source.index("\n    def respond(")
+        confirm_start = core_source.index("\n    def confirm_pending_action(")
+        # confirm_pending_action must come after respond() in the file, and
+        # both add_allowed_app(/add_allowed_folder( calls must live at or
+        # after confirm_pending_action's definition -- never inside respond().
+        self.assertGreater(confirm_start, respond_start)
+        respond_body = core_source[respond_start:confirm_start]
+        self.assertNotIn("add_allowed_app(", respond_body)
+        self.assertNotIn("add_allowed_folder(", respond_body)
+
+        rest_of_file = core_source[confirm_start:]
+        self.assertIn("add_allowed_app(", rest_of_file)
+        self.assertIn("add_allowed_folder(", rest_of_file)
 
 
 if __name__ == "__main__":

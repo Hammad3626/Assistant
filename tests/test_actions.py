@@ -1,4 +1,5 @@
 ﻿import tempfile
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -117,6 +118,39 @@ class ActionTests(unittest.TestCase):
             folders = load_allowed_folders(path)
 
         self.assertEqual(Path(folders["workspace"]), folder)
+
+    def test_add_allowed_folder_succeeds_even_with_stale_existing_entries(self) -> None:
+        """Regression test: a single stale/invalid pre-existing folder entry
+        (e.g. a moved directory or disconnected network drive) must not
+        block adding a brand new, valid folder.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "workspace"
+            folder.mkdir()
+            path = Path(temp_dir) / "folders.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "folders": {
+                            "stale": str(Path(temp_dir) / "does-not-exist-anymore"),
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            add_allowed_folder("workspace", str(folder), path)
+            folders = load_allowed_folders(path)
+
+        self.assertEqual(Path(folders["workspace"]), folder)
+        self.assertNotIn("stale", folders)
+
+    def test_add_allowed_folder_rejects_genuinely_invalid_new_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "folders.json"
+
+            with self.assertRaises(ActionError):
+                add_allowed_folder("ghost", str(Path(temp_dir) / "nonexistent-xyz"), path)
 
     def test_rejects_folder_shell_control_characters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

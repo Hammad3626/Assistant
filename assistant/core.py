@@ -7,7 +7,26 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from assistant.actions import PendingAction, describe_allowed_actions, execute_action, parse_action
+from assistant.actions import (
+    ActionError,
+    DEFAULT_APPS_PATH,
+    PendingAction,
+    add_allowed_app,
+    add_allowed_folder,
+    describe_allowed_actions,
+    execute_action,
+    parse_action,
+    validate_app_target,
+    validate_folder_target,
+)
+from assistant.backup_tools import (
+    DEFAULT_BACKUP_ROOT,
+    TEMP_FILE_PATTERNS,
+    BackupToolError,
+    backup_folder,
+    find_temp_files,
+    list_backups,
+)
 from assistant.about import about_text
 from assistant.aliases import DEFAULT_ALIASES_PATH, AliasError, resolve_alias
 from assistant.audit import ActionAuditStore, AuditError
@@ -45,7 +64,23 @@ from assistant.launch_requests import (
 )
 from assistant.memory import MemoryError, MemoryStore
 from assistant.model_tools import ModelToolError, list_ollama_models
+from assistant.network_tools import (
+    DEFAULT_NETWORK_ALLOWLIST_PATH,
+    NetworkToolError,
+    add_allowed_domain,
+    fetch_url,
+    network_allowlist_summary,
+    normalize_domain,
+    validate_fetch_url,
+)
 from assistant.notes import NotesError, NotesStore
+from assistant.notifications import (
+    DEFAULT_NOTIFICATION_CONFIG_PATH,
+    NotificationConfigError,
+    load_notification_config,
+    notification_config_summary,
+    send_configured_notification,
+)
 from assistant.ollama_client import OllamaClient
 from assistant.outbox import DEFAULT_OUTBOX_PATH, OutboxError, OutboxStore, blocked_send_text
 from assistant.path_report import format_path_report
@@ -111,6 +146,7 @@ class LocalAssistant:
         launch_request_store: LaunchRequestStore | None = None,
         aliases_path: str | Path = DEFAULT_ALIASES_PATH,
         folders_path: str | Path = "config/folders.json",
+        apps_path: str | Path = DEFAULT_APPS_PATH,
         file_trash_dir: str | Path = DEFAULT_FILE_TRASH_DIR,
         file_trash_manifest_path: str | Path = DEFAULT_FILE_TRASH_MANIFEST,
         shell_commands_path: str | Path = DEFAULT_SHELL_COMMANDS_PATH,
@@ -120,6 +156,9 @@ class LocalAssistant:
         script_run_simulation_dir: str | Path = DEFAULT_SCRIPT_RUN_SIMULATION_DIR,
         script_allowlist_simulation_dir: str | Path = DEFAULT_SCRIPT_ALLOWLIST_SIMULATION_DIR,
         file_type_allowlist_path: str | Path = DEFAULT_FILE_TYPE_ALLOWLIST_PATH,
+        network_allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH,
+        backup_root: str | Path = DEFAULT_BACKUP_ROOT,
+        notification_config_path: str | Path = DEFAULT_NOTIFICATION_CONFIG_PATH,
         data_export_dir: str | Path = "exports",
         voice_model_path: str | Path | None = None,
         settings_path: str | Path = "config/settings.json",
@@ -142,9 +181,13 @@ class LocalAssistant:
         )
         self.aliases_path = aliases_path
         self.folders_path = Path(folders_path)
+        self.apps_path = Path(apps_path)
         self.file_trash_dir = Path(file_trash_dir)
         self.file_trash_manifest_path = Path(file_trash_manifest_path)
         self.shell_commands_path = Path(shell_commands_path)
+        self.network_allowlist_path = Path(network_allowlist_path)
+        self.backup_root = Path(backup_root)
+        self.notification_config_path = Path(notification_config_path)
         self.script_checklist_dir = Path(script_checklist_dir)
         self.script_preflight_dir = Path(script_preflight_dir)
         self.script_execution_readiness_dir = Path(script_execution_readiness_dir)
@@ -488,6 +531,45 @@ class LocalAssistant:
         if normalized.startswith("shell checklist verify "):
             return AssistantResponse(self._verify_shell_review_checklist_text(user_text.strip()[23:]))
 
+        if normalized in {"network allowlist", "network domains", "allowed network domains"}:
+            return AssistantResponse(network_allowlist_summary(self.network_allowlist_path))
+
+        if normalized.startswith("allow network domain "):
+            return AssistantResponse(self._allow_network_domain_text(user_text.strip()[len("allow network domain "):]))
+
+        if normalized.startswith("fetch "):
+            return self._fetch_url_confirmation(user_text.strip()[len("fetch "):])
+
+        if normalized.startswith("add app "):
+            return self._add_allowed_app_confirmation(user_text.strip()[len("add app "):])
+
+        if normalized.startswith("add folder "):
+            return self._add_allowed_folder_confirmation(user_text.strip()[len("add folder "):])
+
+        if normalized.startswith("backup folder "):
+            return self._backup_folder_confirmation(user_text.strip()[len("backup folder "):])
+
+        if normalized.startswith("list folder backups "):
+            return AssistantResponse(self._list_backups_text(user_text.strip()[len("list folder backups "):]))
+
+        if normalized in {"list folder backups", "folder backups"}:
+            return AssistantResponse(self._list_backups_text(None))
+
+        if normalized.startswith("clear temp files in "):
+            return self._clear_temp_files_confirmation(user_text.strip()[len("clear temp files in "):])
+
+        if normalized.startswith("find temp files in "):
+            return AssistantResponse(self._find_temp_files_text(user_text.strip()[len("find temp files in "):]))
+
+        if normalized in {"notification settings", "email notification settings"}:
+            return AssistantResponse(notification_config_summary(self.notification_config_path))
+
+        if normalized in {"send daily summary email", "send summary email"}:
+            return self._send_daily_summary_email_confirmation()
+
+
+
+
         if normalized.startswith("shell wizard add "):
             return AssistantResponse(self._add_shell_command_text(user_text.strip()[17:]))
 
@@ -755,6 +837,12 @@ class LocalAssistant:
         if normalized.startswith("approve bulk replace in "):
             return AssistantResponse(self._approve_bulk_replace_text(user_text.strip()[24:]))
 
+        if normalized.startswith("commit bulk replace in "):
+            return self._commit_bulk_replace_confirmation(user_text.strip()[len("commit bulk replace in "):])
+
+        if normalized == "rollback bulk replace":
+            return self._rollback_bulk_replace_confirmation()
+
         if normalized.startswith("preview rename files in "):
             return AssistantResponse(self._preview_rename_files_text(user_text.strip()[24:]))
 
@@ -778,6 +866,13 @@ class LocalAssistant:
 
         if normalized.startswith("restore file "):
             return AssistantResponse(self._restore_file_text(user_text.strip()[13:]))
+
+        if normalized == "empty trash":
+            return self._empty_trash_confirmation(None)
+
+        if normalized.startswith("empty trash older than ") and normalized.endswith(" days"):
+            days_text = user_text.strip()[len("empty trash older than "):-len(" days")]
+            return self._empty_trash_confirmation(days_text)
 
         if normalized.startswith("run shell "):
             return self._shell_command_response(user_text.strip()[10:])
@@ -892,6 +987,84 @@ class LocalAssistant:
                 return run_shell_command(command)
             except ShellToolError as exc:
                 return f"Shell command error: {exc}"
+        if action.kind == "network_fetch":
+            try:
+                # Re-validate at execution time (defense in depth) in case the
+                # allowlist changed between confirmation and execution.
+                result = fetch_url(action.target, self.network_allowlist_path)
+                return result.display_text()
+            except NetworkToolError as exc:
+                return f"Network tool error: {exc}"
+        if action.kind == "add_allowed_app":
+            name, _, target = action.target.partition("\n")
+            try:
+                validate_app_target(target)
+                add_allowed_app(name, target, self.apps_path)
+            except (ActionError, OSError) as exc:
+                return f"Action error: {exc}"
+            return f"Done: Added '{name}' to the allowed apps list."
+        if action.kind == "add_allowed_folder":
+            name, _, target = action.target.partition("\n")
+            try:
+                validate_folder_target(target)
+                add_allowed_folder(name, target, self.folders_path)
+            except (ActionError, OSError) as exc:
+                return f"Action error: {exc}"
+            return f"Done: Added '{name}' to the allowed folders list."
+        if action.kind == "empty_trash":
+            try:
+                entry_numbers = [int(n) for n in action.target.split(",") if n]
+                purged = self._file_tools().purge_trash_entries(entry_numbers)
+            except FileToolError as exc:
+                return f"File tools error: {exc}"
+            return f"Done: Permanently deleted {len(purged)} trash entr{'y' if len(purged) == 1 else 'ies'}. This cannot be undone."
+        if action.kind == "send_notification":
+            try:
+                return send_configured_notification(action.target, self.notification_config_path)
+            except NotificationConfigError as exc:
+                return f"Notification config error: {exc}"
+        if action.kind == "commit_bulk_replace":
+            folder_name, old_text, new_text, phrase = action.target.split("\n")
+            try:
+                return self._file_tools().commit_bulk_replace_plan(folder_name, old_text, new_text, phrase)
+            except FileToolError as exc:
+                return f"File tools error: {exc}"
+        if action.kind == "rollback_bulk_replace":
+            try:
+                return self._file_tools().rollback_bulk_replace_commit()
+            except FileToolError as exc:
+                return f"File tools error: {exc}"
+        if action.kind == "backup_folder":
+            try:
+                result = backup_folder(action.target, self.folders_path, self.backup_root)
+            except BackupToolError as exc:
+                return f"Backup tool error: {exc}"
+            return (
+                f"Done: Backed up '{result.folder_name}' ({result.file_count} file(s)) "
+                f"to {result.destination}."
+            )
+        if action.kind == "clear_temp_files":
+            try:
+                matches = find_temp_files(action.target, self.folders_path)
+            except BackupToolError as exc:
+                return f"Backup tool error: {exc}"
+            if not matches:
+                return f"No temp-file clutter found in '{action.target}'. Nothing to clear."
+            tools = self._file_tools()
+            moved = 0
+            errors: list[str] = []
+            for match in matches:
+                try:
+                    tools.move_temp_pattern_file_to_trash(
+                        match.folder_name, match.relative_path, TEMP_FILE_PATTERNS
+                    )
+                    moved += 1
+                except FileToolError as exc:
+                    errors.append(f"{match.relative_path}: {exc}")
+            summary = f"Done: Moved {moved} temp file(s) in '{action.target}' to the assistant trash (reversible)."
+            if errors:
+                summary += f" {len(errors)} could not be moved: " + "; ".join(errors[:5])
+            return summary
         if action.kind == "file_delete":
             try:
                 folder_name, relative_path = self._parse_pending_file_target(action.target)
@@ -1101,6 +1274,224 @@ class LocalAssistant:
         except LaunchRequestError as exc:
             return f"Launch request error: {exc}"
         return self._safety_snapshot_text(review_type="scripts-drift", drift_threshold=threshold)
+
+    def _allow_network_domain_text(self, domain_text: str) -> str:
+        try:
+            domains = add_allowed_domain(domain_text, self.network_allowlist_path)
+        except NetworkToolError as exc:
+            return f"Network tool error: {exc}"
+        return f"Added '{normalize_domain(domain_text)}' to the network fetch allowlist. Allowed domains: {', '.join(domains)}"
+
+    def _fetch_url_confirmation(self, url_text: str) -> AssistantResponse:
+        try:
+            clean_url = validate_fetch_url(url_text, self.network_allowlist_path)
+        except NetworkToolError as exc:
+            return AssistantResponse(f"Network tool error: {exc}")
+
+        action = PendingAction(
+            kind="network_fetch",
+            target=clean_url,
+            description=f"GET {clean_url} (read-only, allowlisted domain)",
+        )
+        return AssistantResponse(
+            f"Please confirm (allowlisted domain): {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _send_daily_summary_email_confirmation(self) -> AssistantResponse:
+        try:
+            config = load_notification_config(self.notification_config_path)
+        except NotificationConfigError as exc:
+            return AssistantResponse(f"Notification config error: {exc}")
+
+        if not config.enabled:
+            return AssistantResponse(
+                "Email notifications are disabled. Enable them by editing "
+                f"{self.notification_config_path} directly (this cannot be done through chat)."
+            )
+
+        body = self.tasks_store.summary()
+        preview = body if len(body) <= 200 else body[:200] + "..."
+
+        action = PendingAction(
+            kind="send_notification",
+            target=body,
+            description=(
+                f"Send an email to {config.recipient} (the one pre-approved, "
+                f"configured recipient) with your task summary: {preview}"
+            ),
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _commit_bulk_replace_confirmation(self, text: str) -> AssistantResponse:
+        folder_part, separator, phrase = text.rpartition(" confirm ")
+        if not separator:
+            return AssistantResponse(
+                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
+                "find <text> with <text> confirm <phrase>. Run 'backup bulk replace in <folder> "
+                "find <text> with <text>' first to see the required phrase."
+            )
+        folder_name, find_separator, remainder = folder_part.partition(" find ")
+        if not find_separator:
+            return AssistantResponse(
+                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
+                "find <text> with <text> confirm <phrase>"
+            )
+        old_text, with_separator, new_text = remainder.partition(" with ")
+        if not with_separator:
+            return AssistantResponse(
+                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
+                "find <text> with <text> confirm <phrase>"
+            )
+
+        tools = self._file_tools()
+        try:
+            tools.validate_bulk_replace_commit(folder_name, old_text, new_text, phrase.strip())
+        except FileToolError as exc:
+            return AssistantResponse(f"File tools error: {exc}")
+
+        required_phrase = tools.bulk_replace_required_confirmation_phrase(folder_name, old_text, new_text)
+
+        action = PendingAction(
+            kind="commit_bulk_replace",
+            target=f"{folder_name.strip()}\n{old_text.strip()}\n{new_text.strip()}\n{required_phrase}",
+            description=(
+                f"Apply bulk replace ('{old_text.strip()}' -> '{new_text.strip()}') to "
+                f"'{folder_name.strip()}' ({required_phrase}). A backup already exists and this can be rolled back."
+            ),
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _rollback_bulk_replace_confirmation(self) -> AssistantResponse:
+        action = PendingAction(
+            kind="rollback_bulk_replace",
+            target="",
+            description="Roll back the most recently applied bulk replace to its pre-apply state",
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _backup_folder_confirmation(self, folder_name: str) -> AssistantResponse:
+        folder_name = folder_name.strip()
+        if not folder_name:
+            return AssistantResponse("Backup expects: backup folder <name>, for example: backup folder downloads")
+
+        action = PendingAction(
+            kind="backup_folder",
+            target=folder_name,
+            description=f"Back up allowlisted folder '{folder_name}' to a new timestamped copy",
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _list_backups_text(self, folder_name: str | None) -> str:
+        records = list_backups(folder_name, self.backup_root)
+        if not records:
+            scope = f" for '{folder_name.strip()}'" if folder_name else ""
+            return f"No backups found{scope}."
+        lines = ["Backups:"]
+        for record in records[-20:]:
+            lines.append(
+                f"- {record.get('folder_name')}: {record.get('file_count')} file(s) at "
+                f"{record.get('created_at')} -> {record.get('destination')}"
+            )
+        return "\n".join(lines)
+
+    def _find_temp_files_text(self, folder_name: str) -> str:
+        try:
+            matches = find_temp_files(folder_name.strip(), self.folders_path)
+        except BackupToolError as exc:
+            return f"Backup tool error: {exc}"
+        if not matches:
+            return f"No temp-file clutter found in '{folder_name.strip()}'."
+        lines = [f"Temp-file clutter in '{folder_name.strip()}' ({len(matches)} file(s)):"]
+        for match in matches[:50]:
+            lines.append(f"- {match.relative_path} ({match.size_bytes} bytes)")
+        if len(matches) > 50:
+            lines.append(f"... and {len(matches) - 50} more.")
+        lines.append("\nTo move these to the assistant trash (reversible), say: clear temp files in " + folder_name.strip())
+        return "\n".join(lines)
+
+    def _clear_temp_files_confirmation(self, folder_name: str) -> AssistantResponse:
+        folder_name = folder_name.strip()
+        try:
+            matches = find_temp_files(folder_name, self.folders_path)
+        except BackupToolError as exc:
+            return AssistantResponse(f"Backup tool error: {exc}")
+        if not matches:
+            return AssistantResponse(f"No temp-file clutter found in '{folder_name}'. Nothing to clear.")
+
+        preview_lines = [f"{m.relative_path} ({m.size_bytes} bytes)" for m in matches[:20]]
+        preview = "; ".join(preview_lines)
+        if len(matches) > 20:
+            preview += f"; ... and {len(matches) - 20} more"
+
+        action = PendingAction(
+            kind="clear_temp_files",
+            target=folder_name,
+            description=(
+                f"Move {len(matches)} temp file(s) in '{folder_name}' to the assistant trash "
+                f"(reversible, not permanent deletion): {preview}"
+            ),
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _add_allowed_app_confirmation(self, text: str) -> AssistantResponse:
+        name, separator, target = text.partition(" at ")
+        if not separator or not name.strip() or not target.strip():
+            return AssistantResponse(
+                "Add app expects: add app <name> at <path>, for example: "
+                "add app steam at C:\\Program Files (x86)\\Steam\\Steam.exe"
+            )
+        try:
+            validate_app_target(target)
+        except ActionError as exc:
+            return AssistantResponse(f"Action error: {exc}")
+
+        action = PendingAction(
+            kind="add_allowed_app",
+            target=f"{name.strip()}\n{target.strip()}",
+            description=f"Add '{name.strip()}' to the allowed apps list -> {target.strip()}",
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
+
+    def _add_allowed_folder_confirmation(self, text: str) -> AssistantResponse:
+        name, separator, target = text.partition(" at ")
+        if not separator or not name.strip() or not target.strip():
+            return AssistantResponse(
+                "Add folder expects: add folder <name> at <path>, for example: "
+                "add folder projects at D:\\Projects"
+            )
+        try:
+            validate_folder_target(target)
+        except ActionError as exc:
+            return AssistantResponse(f"Action error: {exc}")
+
+        action = PendingAction(
+            kind="add_allowed_folder",
+            target=f"{name.strip()}\n{target.strip()}",
+            description=f"Add '{name.strip()}' to the allowed folders list -> {target.strip()}",
+        )
+        return AssistantResponse(
+            f"Please confirm: {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
 
     def _shell_commands_text(self) -> str:
         try:
@@ -2165,6 +2556,46 @@ class LocalAssistant:
         except FileToolError as exc:
             return f"File tools error: {exc}"
         return f"Restored file {entry_number}: {entry.display_text()}"
+
+    def _empty_trash_confirmation(self, days_text: str | None) -> AssistantResponse:
+        tools = self._file_tools()
+        try:
+            if days_text is None:
+                entries = list(enumerate(tools.list_file_trash(), start=1))
+                scope_label = "all"
+            else:
+                try:
+                    days = int(days_text.strip())
+                except ValueError:
+                    return AssistantResponse(
+                        "Empty trash expects: empty trash, or empty trash older than <N> days"
+                    )
+                entries = tools.trash_entries_older_than(days)
+                scope_label = f"older than {days} day(s)"
+        except FileToolError as exc:
+            return AssistantResponse(f"File tools error: {exc}")
+
+        if not entries:
+            return AssistantResponse(f"No trash entries ({scope_label}) to empty. Nothing to do.")
+
+        entry_numbers = [number for number, _entry in entries]
+        preview_lines = [f"{number}. {entry.display_text()}" for number, entry in entries[:20]]
+        preview = "; ".join(preview_lines)
+        if len(entries) > 20:
+            preview += f"; ... and {len(entries) - 20} more"
+
+        action = PendingAction(
+            kind="empty_trash",
+            target=",".join(str(n) for n in entry_numbers),
+            description=(
+                f"PERMANENTLY delete {len(entries)} trash entr{'y' if len(entries) == 1 else 'ies'} "
+                f"({scope_label}) -- this cannot be undone: {preview}"
+            ),
+        )
+        return AssistantResponse(
+            f"Please confirm (irreversible): {action.description}. Type 'yes' to continue.",
+            pending_action=action,
+        )
 
     @staticmethod
     def _pending_file_target(folder_name: str, relative_path: str) -> str:

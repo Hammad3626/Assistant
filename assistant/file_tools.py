@@ -233,6 +233,50 @@ class AllowlistedFileTools:
         self._write_file_trash(entries)
         return entry
 
+    def move_temp_pattern_file_to_trash(
+        self, folder_name: str, relative_path: str, allowed_patterns: tuple[str, ...]
+    ) -> FileTrashEntry:
+        """Move a file matching a known temp-file pattern (*.tmp, Thumbs.db,
+        etc.) to the assistant trash, bypassing the general TEXT_EXTENSIONS
+        restriction used by move_file_to_trash().
+
+        This exists specifically for maintenance/cleanup flows: real temp
+        clutter is rarely a "common text file" (it's .tmp/.bak/Thumbs.db/
+        .DS_Store/etc.), so the stricter text-only check would otherwise
+        block clearing it. The safety net here is the explicit pattern
+        allowlist the caller must supply -- only files matching a known,
+        narrow junk-file pattern can go through this path, never an
+        arbitrary extension.
+        """
+        import fnmatch as _fnmatch
+
+        canonical_name, root = self._resolve_folder(folder_name)
+        file_path = self._resolve_file(root, relative_path)
+        self._reject_trash_storage_path(file_path)
+        if not any(_fnmatch.fnmatch(file_path.name, pattern) for pattern in allowed_patterns):
+            raise FileToolError(
+                f"'{relative_path}' does not match a known temp-file pattern; refusing to trash it."
+            )
+
+        entries = self.list_file_trash()
+        self.trash_dir.mkdir(parents=True, exist_ok=True)
+        trash_name = f"{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex}-{file_path.name}"
+        trash_path = self.trash_dir / trash_name
+        try:
+            shutil.move(str(file_path), trash_path)
+        except OSError as exc:
+            raise FileToolError(f"Could not move file to assistant trash: {relative_path}") from exc
+
+        entry = FileTrashEntry(
+            original_folder_name=canonical_name,
+            original_relative_path=_relative_text(file_path, root),
+            trash_path=str(trash_path),
+            deleted_at=_utc_now_iso(),
+        )
+        entries.append(entry)
+        self._write_file_trash(entries)
+        return entry
+
     def validate_trash_candidate(self, folder_name: str, relative_path: str) -> Path:
         """Return the resolved file path if it can be moved to assistant trash."""
         _, root = self._resolve_folder(folder_name)
@@ -310,6 +354,268 @@ class AllowlistedFileTools:
         entries.pop(entry_number - 1)
         self._write_file_trash(entries)
         return entry
+
+    def trash_entries_older_than(self, days: int) -> list[tuple[int, FileTrashEntry]]:
+        """Return (1-based entry_number, entry) pairs for trash items whose
+        deleted_at timestamp is older than the given number of days.
+        """
+        from datetime import datetime, timezone
+
+        cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
+        results: list[tuple[int, FileTrashEntry]] = []
+        for index, entry in enumerate(self.list_file_trash(), start=1):
+            try:
+                deleted_at = datetime.strptime(entry.deleted_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+            except ValueError:
+                continue
+            if deleted_at.timestamp() < cutoff:
+                results.append((index, entry))
+        return results
+
+    def purge_trash_entries(self, entry_numbers: list[int]) -> list[FileTrashEntry]:
+        """Permanently delete specific trash entries by 1-based entry number.
+
+        This is the one genuinely irreversible deletion path in the app. It
+        is reachable only as an explicit second step on items that are
+        already sitting in the reversible trash (i.e. the person already
+        confirmed removing them once) -- never a direct delete of a live
+        file. Callers are expected to have already shown the person exactly
+        which entries this will affect and gotten a fresh confirmation.
+        """
+        entries = self.list_file_trash()
+        if not entry_numbers:
+            raise FileToolError("No trash entries were specified to purge.")
+
+        unique_numbers = sorted(set(entry_numbers), reverse=True)
+        for number in unique_numbers:
+            if number < 1 or number > len(entries):
+                raise FileToolError(f"File trash number must be between 1 and {len(entries)}.")
+
+        purged: list[FileTrashEntry] = []
+        for number in unique_numbers:
+            entry = entries[number - 1]
+            trash_path = Path(entry.trash_path)
+            try:
+                if trash_path.exists():
+                    trash_path.unlink()
+            except OSError as exc:
+                raise FileToolError(f"Could not permanently delete: {entry.display_text()}") from exc
+            purged.append(entry)
+            del entries[number - 1]
+
+        self._write_file_trash(entries)
+        return purged
+
+    def bulk_replace_required_confirmation_phrase(
+        self,
+        folder_name: str,
+        old_text: str,
+        new_text: str,
+        limit: int = MAX_BULK_PLAN_ITEMS,
+    ) -> str:
+        """The exact phrase the operator must type back to commit this plan.
+
+        Deliberately derived from the live plan (folder + file count) so it
+        cannot be copy-pasted from a stale/different plan without the count
+        matching, and so the operator has to have actually looked at what
+        they're approving.
+        """
+        canonical_name, _root = self._resolve_folder(folder_name)
+        clean_old = " ".join(old_text.strip().split())
+        clean_new = " ".join(new_text.strip().split())
+        items = self.bulk_replace_plan(folder_name, clean_old, clean_new, limit=limit)
+        return f"apply {len(items)} files in {canonical_name}"
+
+    def validate_bulk_replace_commit(
+        self,
+        folder_name: str,
+        old_text: str,
+        new_text: str,
+        confirmation_phrase: str,
+        limit: int = MAX_BULK_PLAN_ITEMS,
+    ) -> tuple[Path, dict[str, object]]:
+        """Run every commit precondition without writing anything.
+
+        Returns (backup_dir, backup_manifest) if everything checks out, or
+        raises FileToolError describing exactly what's wrong. This is safe
+        to call eagerly (e.g. before even offering a confirmation prompt)
+        since it has no side effects, and is also re-run at actual commit
+        time as defense in depth against anything changing in between.
+        """
+        canonical_name, root = self._resolve_folder(folder_name)
+        clean_old = " ".join(old_text.strip().split())
+        clean_new = " ".join(new_text.strip().split())
+        if not clean_old:
+            raise FileToolError("Bulk replace commit needs text to find.")
+        if not clean_new:
+            raise FileToolError("Bulk replace commit needs replacement text.")
+
+        backup_dir, backup_manifest = self._latest_manifest(self.bulk_backup_dir)
+        if backup_manifest.get("kind") != "bulk_replace_backup":
+            raise FileToolError("No bulk replace backup found. Run a backup first.")
+        if backup_manifest.get("folder") != canonical_name:
+            raise FileToolError(
+                f"Latest backup is for folder '{backup_manifest.get('folder')}', not '{canonical_name}'. "
+                "Take a fresh backup for this folder first."
+            )
+        if backup_manifest.get("find") != clean_old or backup_manifest.get("replace_with") != clean_new:
+            raise FileToolError(
+                "Latest backup does not match this find/replace text. Take a fresh backup first."
+            )
+        if backup_manifest.get("apply_enabled"):
+            raise FileToolError("This backup has already been applied. Take a fresh backup to apply again.")
+
+        status, notes = _manifest_hash_status(backup_manifest, "Backup")
+        if status != "ok":
+            raise FileToolError(f"Backup manifest failed integrity check: {'; '.join(notes)}")
+
+        backup_files = backup_manifest.get("files")
+        if not isinstance(backup_files, list) or not backup_files:
+            raise FileToolError("Backup manifest has no files recorded.")
+
+        # Re-verify the live files on disk still match exactly what was
+        # backed up (no drift since the backup was taken) before writing
+        # anything.
+        for record in backup_files:
+            if not isinstance(record, dict):
+                raise FileToolError("Backup manifest is malformed.")
+            relative_path = record.get("relative_path")
+            expected_hash = record.get("source_sha256")
+            if not isinstance(relative_path, str) or not relative_path:
+                raise FileToolError("Backup manifest has an invalid file entry.")
+            live_path = self._resolve_file(root, relative_path)
+            if not live_path.exists():
+                raise FileToolError(
+                    f"File has changed since backup (now missing): {relative_path}. "
+                    "Take a fresh backup before committing."
+                )
+            live_hash = _file_metadata(live_path)["sha256"]
+            if live_hash != expected_hash:
+                raise FileToolError(
+                    f"File has changed since backup: {relative_path}. "
+                    "Take a fresh backup before committing."
+                )
+
+        required_phrase = self.bulk_replace_required_confirmation_phrase(
+            folder_name, clean_old, clean_new, limit=limit
+        )
+        if confirmation_phrase.strip() != required_phrase:
+            raise FileToolError(
+                f"Confirmation phrase did not match. Expected exactly: '{required_phrase}'"
+            )
+        if len(backup_files) != int(required_phrase.split()[1]):
+            raise FileToolError(
+                "The plan has changed since the backup was taken (different file count). "
+                "Take a fresh backup before committing."
+            )
+
+        return backup_dir, backup_manifest
+
+    def commit_bulk_replace_plan(
+        self,
+        folder_name: str,
+        old_text: str,
+        new_text: str,
+        confirmation_phrase: str,
+        limit: int = MAX_BULK_PLAN_ITEMS,
+    ) -> str:
+        """Actually apply a previously backed-up bulk replace plan.
+
+        Preconditions, all required (see validate_bulk_replace_commit):
+        1. A backup for this exact folder/find/replace already exists
+           (via backup_bulk_replace_plan), its manifest hash is intact, and
+           it has not already been applied.
+        2. The live files on disk right now match exactly what the backup
+           recorded (same files, same content hashes) -- if anything has
+           changed since the backup was taken, this refuses rather than
+           applying against a plan that's gone stale.
+        3. confirmation_phrase exactly matches the phrase computed fresh
+           from the current plan (see bulk_replace_required_confirmation_phrase).
+
+        On success, files are modified in place, but originals remain
+        recoverable via rollback_bulk_replace_commit() using this same
+        backup, since the backup copies are never deleted.
+        """
+        canonical_name, root = self._resolve_folder(folder_name)
+        clean_old = " ".join(old_text.strip().split())
+        clean_new = " ".join(new_text.strip().split())
+        backup_dir, backup_manifest = self.validate_bulk_replace_commit(
+            folder_name, old_text, new_text, confirmation_phrase, limit=limit
+        )
+        backup_files = backup_manifest["files"]
+
+        changed_files: list[str] = []
+        for record in backup_files:
+            relative_path = record["relative_path"]
+            live_path = self._resolve_file(root, relative_path)
+            try:
+                original_text = live_path.read_text(encoding="utf-8")
+                updated_text = original_text.replace(clean_old, clean_new)
+                live_path.write_text(updated_text, encoding="utf-8")
+            except OSError as exc:
+                raise FileToolError(f"Failed applying change to: {relative_path}") from exc
+            changed_files.append(relative_path)
+
+        backup_manifest["apply_enabled"] = True
+        backup_manifest["applied_at"] = _utc_now_iso()
+        self._write_bulk_backup_manifest(backup_dir, _annotate_manifest_hash(backup_manifest))
+
+        return (
+            f"Done: Applied bulk replace to {len(changed_files)} file(s) in '{canonical_name}'. "
+            f"Backup preserved at {backup_dir} for rollback."
+        )
+
+    def rollback_bulk_replace_commit(self) -> str:
+        """Restore files from the most recent applied bulk replace backup.
+
+        Only works on a backup that was actually committed
+        (apply_enabled=True) and has not already been rolled back, and
+        verifies each backed-up file's hash before restoring it.
+        """
+        backup_dir, backup_manifest = self._latest_manifest(self.bulk_backup_dir)
+        if backup_manifest.get("kind") != "bulk_replace_backup":
+            raise FileToolError("No bulk replace backup found to roll back.")
+        if not backup_manifest.get("apply_enabled"):
+            raise FileToolError("This backup was never applied, so there is nothing to roll back.")
+        if backup_manifest.get("rolled_back_at"):
+            raise FileToolError("This backup has already been rolled back.")
+
+        status, notes = _manifest_hash_status(backup_manifest, "Backup")
+        if status != "ok":
+            raise FileToolError(f"Backup manifest failed integrity check: {'; '.join(notes)}")
+
+        canonical_name = backup_manifest.get("folder")
+        if not isinstance(canonical_name, str):
+            raise FileToolError("Backup manifest is missing its folder name.")
+        _canonical_name, root = self._resolve_folder(canonical_name)
+
+        entries = _rollback_entries_from_backup_manifest(backup_manifest)
+        restored: list[str] = []
+        for entry in entries:
+            backup_relative_path = entry["backup_relative_path"]
+            restore_relative_path = entry["restore_relative_path"]
+            backup_file_path = backup_dir / "files" / backup_relative_path
+            expected_hash = entry.get("backup_sha256")
+            if not backup_file_path.exists():
+                raise FileToolError(f"Backup copy is missing, cannot restore: {backup_relative_path}")
+            actual_hash = _file_metadata(backup_file_path)["sha256"]
+            if expected_hash and actual_hash != expected_hash:
+                raise FileToolError(
+                    f"Backup copy integrity check failed for: {backup_relative_path}"
+                )
+            restore_target = self._resolve_file(root, restore_relative_path)
+            try:
+                shutil.copy2(backup_file_path, restore_target)
+            except OSError as exc:
+                raise FileToolError(f"Could not restore file: {restore_relative_path}") from exc
+            restored.append(restore_relative_path)
+
+        backup_manifest["rolled_back_at"] = _utc_now_iso()
+        self._write_bulk_backup_manifest(backup_dir, _annotate_manifest_hash(backup_manifest))
+
+        return f"Done: Rolled back {len(restored)} file(s) in '{canonical_name}' to their pre-apply state."
 
     def search_files_summary(
         self,

@@ -1,0 +1,2617 @@
+diff --git a/assistant/actions.py b/assistant/actions.py
+index 0a06a70..c0191ff 100644
+--- a/assistant/actions.py
++++ b/assistant/actions.py
+@@ -195,10 +195,30 @@ def add_allowed_folder(
+     target: str,
+     path: str | Path = DEFAULT_FOLDERS_PATH,
+ ) -> dict[str, str]:
++    # Validate the specific new entry explicitly and eagerly, so the caller
++    # gets an immediate, clear error if it's invalid.
++    clean_target = normalize_folder_path(target)
++    validate_folder_target(clean_target)
++
+     folders = load_allowed_folders(path)
+-    folders[normalize_action_text(name)] = normalize_folder_path(target)
+-    save_allowed_folders(folders, path)
+-    return folders
++
++    # Drop any pre-existing entries that no longer validate (e.g. a moved
++    # directory, a disconnected network drive, or -- when no folders.json
++    # exists yet -- default_folders()'s synthetic placeholder paths, which
++    # are not validated at the point they're generated). Without this, a
++    # single stale, unrelated entry would abort save_allowed_folders() below
++    # and block adding this brand new, perfectly valid folder.
++    valid_existing: dict[str, str] = {}
++    for existing_name, existing_target in folders.items():
++        try:
++            validate_folder_target(existing_target)
++        except ActionError:
++            continue
++        valid_existing[existing_name] = existing_target
++
++    valid_existing[normalize_action_text(name)] = clean_target
++    save_allowed_folders(valid_existing, path)
++    return valid_existing
+ 
+ 
+ def validate_app_target(target: str) -> None:
+diff --git a/assistant/backup_tools.py b/assistant/backup_tools.py
+new file mode 100644
+index 0000000..f8690ad
+--- /dev/null
++++ b/assistant/backup_tools.py
+@@ -0,0 +1,188 @@
++"""Named backup and maintenance operations for allowlisted folders.
++
++These are implemented as plain Python file operations rather than shell
++commands, so there is no subprocess/argv involved at all:
++
++- backup_folder() copies an allowlisted folder to a timestamped destination.
++  It never modifies or removes anything in the source folder.
++- find_temp_files() / clear_temp_files() identify common temp-file clutter
++  (*.tmp, *.log, Thumbs.db, etc.) inside an allowlisted folder. Removal
++  always goes through the existing reversible file-trash mechanism
++  (AllowlistedFileTools.move_file_to_trash) -- never a permanent delete.
++"""
++
++from __future__ import annotations
++
++import fnmatch
++import json
++import shutil
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++from uuid import uuid4
++
++from assistant.actions import DEFAULT_FOLDERS_PATH, load_allowed_folders
++
++
++UTC = timezone.utc
++
++DEFAULT_BACKUP_ROOT = Path("data/backups")
++MAX_BACKUP_FILES = 20_000
++TEMP_FILE_PATTERNS = ("*.tmp", "*.temp", "*.log", "*.bak", "~*", "Thumbs.db", ".DS_Store")
++
++
++class BackupToolError(RuntimeError):
++    """Raised when a backup or maintenance operation cannot proceed safely."""
++
++
++@dataclass(frozen=True)
++class BackupResult:
++    folder_name: str
++    source: str
++    destination: str
++    file_count: int
++    created_at: str
++
++
++@dataclass(frozen=True)
++class TempFileMatch:
++    folder_name: str
++    relative_path: str
++    size_bytes: int
++
++
++def _utc_now_iso() -> str:
++    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def _resolve_allowed_folder(folder_name: str, folders_path: str | Path) -> tuple[str, Path]:
++    """Resolve a folder name against the existing folders allowlist.
++
++    Backups/maintenance may only ever operate on folders already present in
++    the user's folder allowlist -- never an arbitrary path -- so this reuses
++    the exact same allowlist the rest of the app already trusts.
++    """
++    folders = load_allowed_folders(folders_path)
++    clean_name = " ".join(folder_name.strip().lower().split())
++    if clean_name not in folders:
++        available = ", ".join(sorted(folders)) or "(none configured)"
++        raise BackupToolError(
++            f"'{folder_name}' is not an allowlisted folder. Available folders: {available}"
++        )
++    root = Path(folders[clean_name])
++    if not root.exists() or not root.is_dir():
++        raise BackupToolError(f"Allowlisted folder no longer exists on disk: {root}")
++    return clean_name, root
++
++
++def backup_folder(
++    folder_name: str,
++    folders_path: str | Path = DEFAULT_FOLDERS_PATH,
++    backup_root: str | Path = DEFAULT_BACKUP_ROOT,
++) -> BackupResult:
++    """Copy an allowlisted folder to a new timestamped backup destination.
++
++    This never touches the source folder -- it is a pure, additive copy.
++    """
++    canonical_name, source_root = _resolve_allowed_folder(folder_name, folders_path)
++
++    file_count = sum(1 for p in source_root.rglob("*") if p.is_file())
++    if file_count > MAX_BACKUP_FILES:
++        raise BackupToolError(
++            f"'{canonical_name}' has {file_count} files, over the {MAX_BACKUP_FILES} "
++            "safety limit for a single backup operation."
++        )
++
++    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
++    safe_name = canonical_name.replace(" ", "_")
++    destination = Path(backup_root) / safe_name / timestamp
++    destination.parent.mkdir(parents=True, exist_ok=True)
++
++    try:
++        shutil.copytree(source_root, destination)
++    except OSError as exc:
++        raise BackupToolError(f"Backup failed: {exc}") from exc
++
++    result = BackupResult(
++        folder_name=canonical_name,
++        source=str(source_root),
++        destination=str(destination),
++        file_count=file_count,
++        created_at=_utc_now_iso(),
++    )
++    _record_backup(result, backup_root)
++    return result
++
++
++def _record_backup(result: BackupResult, backup_root: str | Path) -> None:
++    manifest_path = Path(backup_root) / "backups_manifest.json"
++    manifest_path.parent.mkdir(parents=True, exist_ok=True)
++    records: list[dict[str, object]] = []
++    if manifest_path.exists():
++        try:
++            raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
++            if isinstance(raw, dict) and isinstance(raw.get("backups"), list):
++                records = raw["backups"]
++        except (json.JSONDecodeError, OSError):
++            records = []
++    records.append(
++        {
++            "id": uuid4().hex,
++            "folder_name": result.folder_name,
++            "source": result.source,
++            "destination": result.destination,
++            "file_count": result.file_count,
++            "created_at": result.created_at,
++        }
++    )
++    manifest_path.write_text(json.dumps({"backups": records}, indent=2) + "\n", encoding="utf-8")
++
++
++def list_backups(
++    folder_name: str | None = None,
++    backup_root: str | Path = DEFAULT_BACKUP_ROOT,
++) -> list[dict[str, object]]:
++    manifest_path = Path(backup_root) / "backups_manifest.json"
++    if not manifest_path.exists():
++        return []
++    try:
++        raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
++    except (json.JSONDecodeError, OSError):
++        return []
++    records = raw.get("backups", []) if isinstance(raw, dict) else []
++    if folder_name is None:
++        return records
++    clean_name = " ".join(folder_name.strip().lower().split())
++    return [r for r in records if r.get("folder_name") == clean_name]
++
++
++def find_temp_files(
++    folder_name: str,
++    folders_path: str | Path = DEFAULT_FOLDERS_PATH,
++    patterns: tuple[str, ...] = TEMP_FILE_PATTERNS,
++    limit: int = 500,
++) -> list[TempFileMatch]:
++    """List files inside an allowlisted folder that match common temp-file
++    patterns. Does not modify or move anything -- pure read-only scan.
++    """
++    canonical_name, root = _resolve_allowed_folder(folder_name, folders_path)
++
++    matches: list[TempFileMatch] = []
++    for path in sorted(root.rglob("*")):
++        if not path.is_file():
++            continue
++        if any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns):
++            try:
++                size = path.stat().st_size
++            except OSError:
++                size = 0
++            matches.append(
++                TempFileMatch(
++                    folder_name=canonical_name,
++                    relative_path=str(path.relative_to(root)),
++                    size_bytes=size,
++                )
++            )
++            if len(matches) >= limit:
++                break
++    return matches
+diff --git a/assistant/core.py b/assistant/core.py
+index 3162f80..225a34e 100644
+--- a/assistant/core.py
++++ b/assistant/core.py
+@@ -7,7 +7,26 @@ from dataclasses import dataclass
+ from datetime import datetime
+ from pathlib import Path
+ 
+-from assistant.actions import PendingAction, describe_allowed_actions, execute_action, parse_action
++from assistant.actions import (
++    ActionError,
++    DEFAULT_APPS_PATH,
++    PendingAction,
++    add_allowed_app,
++    add_allowed_folder,
++    describe_allowed_actions,
++    execute_action,
++    parse_action,
++    validate_app_target,
++    validate_folder_target,
++)
++from assistant.backup_tools import (
++    DEFAULT_BACKUP_ROOT,
++    TEMP_FILE_PATTERNS,
++    BackupToolError,
++    backup_folder,
++    find_temp_files,
++    list_backups,
++)
+ from assistant.about import about_text
+ from assistant.aliases import DEFAULT_ALIASES_PATH, AliasError, resolve_alias
+ from assistant.audit import ActionAuditStore, AuditError
+@@ -45,7 +64,23 @@ from assistant.launch_requests import (
+ )
+ from assistant.memory import MemoryError, MemoryStore
+ from assistant.model_tools import ModelToolError, list_ollama_models
++from assistant.network_tools import (
++    DEFAULT_NETWORK_ALLOWLIST_PATH,
++    NetworkToolError,
++    add_allowed_domain,
++    fetch_url,
++    network_allowlist_summary,
++    normalize_domain,
++    validate_fetch_url,
++)
+ from assistant.notes import NotesError, NotesStore
++from assistant.notifications import (
++    DEFAULT_NOTIFICATION_CONFIG_PATH,
++    NotificationConfigError,
++    load_notification_config,
++    notification_config_summary,
++    send_configured_notification,
++)
+ from assistant.ollama_client import OllamaClient
+ from assistant.outbox import DEFAULT_OUTBOX_PATH, OutboxError, OutboxStore, blocked_send_text
+ from assistant.path_report import format_path_report
+@@ -111,6 +146,7 @@ class LocalAssistant:
+         launch_request_store: LaunchRequestStore | None = None,
+         aliases_path: str | Path = DEFAULT_ALIASES_PATH,
+         folders_path: str | Path = "config/folders.json",
++        apps_path: str | Path = DEFAULT_APPS_PATH,
+         file_trash_dir: str | Path = DEFAULT_FILE_TRASH_DIR,
+         file_trash_manifest_path: str | Path = DEFAULT_FILE_TRASH_MANIFEST,
+         shell_commands_path: str | Path = DEFAULT_SHELL_COMMANDS_PATH,
+@@ -120,6 +156,9 @@ class LocalAssistant:
+         script_run_simulation_dir: str | Path = DEFAULT_SCRIPT_RUN_SIMULATION_DIR,
+         script_allowlist_simulation_dir: str | Path = DEFAULT_SCRIPT_ALLOWLIST_SIMULATION_DIR,
+         file_type_allowlist_path: str | Path = DEFAULT_FILE_TYPE_ALLOWLIST_PATH,
++        network_allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH,
++        backup_root: str | Path = DEFAULT_BACKUP_ROOT,
++        notification_config_path: str | Path = DEFAULT_NOTIFICATION_CONFIG_PATH,
+         data_export_dir: str | Path = "exports",
+         voice_model_path: str | Path | None = None,
+         settings_path: str | Path = "config/settings.json",
+@@ -142,9 +181,13 @@ class LocalAssistant:
+         )
+         self.aliases_path = aliases_path
+         self.folders_path = Path(folders_path)
++        self.apps_path = Path(apps_path)
+         self.file_trash_dir = Path(file_trash_dir)
+         self.file_trash_manifest_path = Path(file_trash_manifest_path)
+         self.shell_commands_path = Path(shell_commands_path)
++        self.network_allowlist_path = Path(network_allowlist_path)
++        self.backup_root = Path(backup_root)
++        self.notification_config_path = Path(notification_config_path)
+         self.script_checklist_dir = Path(script_checklist_dir)
+         self.script_preflight_dir = Path(script_preflight_dir)
+         self.script_execution_readiness_dir = Path(script_execution_readiness_dir)
+@@ -488,6 +531,45 @@ class LocalAssistant:
+         if normalized.startswith("shell checklist verify "):
+             return AssistantResponse(self._verify_shell_review_checklist_text(user_text.strip()[23:]))
+ 
++        if normalized in {"network allowlist", "network domains", "allowed network domains"}:
++            return AssistantResponse(network_allowlist_summary(self.network_allowlist_path))
++
++        if normalized.startswith("allow network domain "):
++            return AssistantResponse(self._allow_network_domain_text(user_text.strip()[len("allow network domain "):]))
++
++        if normalized.startswith("fetch "):
++            return self._fetch_url_confirmation(user_text.strip()[len("fetch "):])
++
++        if normalized.startswith("add app "):
++            return self._add_allowed_app_confirmation(user_text.strip()[len("add app "):])
++
++        if normalized.startswith("add folder "):
++            return self._add_allowed_folder_confirmation(user_text.strip()[len("add folder "):])
++
++        if normalized.startswith("backup folder "):
++            return self._backup_folder_confirmation(user_text.strip()[len("backup folder "):])
++
++        if normalized.startswith("list folder backups "):
++            return AssistantResponse(self._list_backups_text(user_text.strip()[len("list folder backups "):]))
++
++        if normalized in {"list folder backups", "folder backups"}:
++            return AssistantResponse(self._list_backups_text(None))
++
++        if normalized.startswith("clear temp files in "):
++            return self._clear_temp_files_confirmation(user_text.strip()[len("clear temp files in "):])
++
++        if normalized.startswith("find temp files in "):
++            return AssistantResponse(self._find_temp_files_text(user_text.strip()[len("find temp files in "):]))
++
++        if normalized in {"notification settings", "email notification settings"}:
++            return AssistantResponse(notification_config_summary(self.notification_config_path))
++
++        if normalized in {"send daily summary email", "send summary email"}:
++            return self._send_daily_summary_email_confirmation()
++
++
++
++
+         if normalized.startswith("shell wizard add "):
+             return AssistantResponse(self._add_shell_command_text(user_text.strip()[17:]))
+ 
+@@ -755,6 +837,12 @@ class LocalAssistant:
+         if normalized.startswith("approve bulk replace in "):
+             return AssistantResponse(self._approve_bulk_replace_text(user_text.strip()[24:]))
+ 
++        if normalized.startswith("commit bulk replace in "):
++            return self._commit_bulk_replace_confirmation(user_text.strip()[len("commit bulk replace in "):])
++
++        if normalized == "rollback bulk replace":
++            return self._rollback_bulk_replace_confirmation()
++
+         if normalized.startswith("preview rename files in "):
+             return AssistantResponse(self._preview_rename_files_text(user_text.strip()[24:]))
+ 
+@@ -779,6 +867,13 @@ class LocalAssistant:
+         if normalized.startswith("restore file "):
+             return AssistantResponse(self._restore_file_text(user_text.strip()[13:]))
+ 
++        if normalized == "empty trash":
++            return self._empty_trash_confirmation(None)
++
++        if normalized.startswith("empty trash older than ") and normalized.endswith(" days"):
++            days_text = user_text.strip()[len("empty trash older than "):-len(" days")]
++            return self._empty_trash_confirmation(days_text)
++
+         if normalized.startswith("run shell "):
+             return self._shell_command_response(user_text.strip()[10:])
+ 
+@@ -892,6 +987,84 @@ class LocalAssistant:
+                 return run_shell_command(command)
+             except ShellToolError as exc:
+                 return f"Shell command error: {exc}"
++        if action.kind == "network_fetch":
++            try:
++                # Re-validate at execution time (defense in depth) in case the
++                # allowlist changed between confirmation and execution.
++                result = fetch_url(action.target, self.network_allowlist_path)
++                return result.display_text()
++            except NetworkToolError as exc:
++                return f"Network tool error: {exc}"
++        if action.kind == "add_allowed_app":
++            name, _, target = action.target.partition("\n")
++            try:
++                validate_app_target(target)
++                add_allowed_app(name, target, self.apps_path)
++            except (ActionError, OSError) as exc:
++                return f"Action error: {exc}"
++            return f"Done: Added '{name}' to the allowed apps list."
++        if action.kind == "add_allowed_folder":
++            name, _, target = action.target.partition("\n")
++            try:
++                validate_folder_target(target)
++                add_allowed_folder(name, target, self.folders_path)
++            except (ActionError, OSError) as exc:
++                return f"Action error: {exc}"
++            return f"Done: Added '{name}' to the allowed folders list."
++        if action.kind == "empty_trash":
++            try:
++                entry_numbers = [int(n) for n in action.target.split(",") if n]
++                purged = self._file_tools().purge_trash_entries(entry_numbers)
++            except FileToolError as exc:
++                return f"File tools error: {exc}"
++            return f"Done: Permanently deleted {len(purged)} trash entr{'y' if len(purged) == 1 else 'ies'}. This cannot be undone."
++        if action.kind == "send_notification":
++            try:
++                return send_configured_notification(action.target, self.notification_config_path)
++            except NotificationConfigError as exc:
++                return f"Notification config error: {exc}"
++        if action.kind == "commit_bulk_replace":
++            folder_name, old_text, new_text, phrase = action.target.split("\n")
++            try:
++                return self._file_tools().commit_bulk_replace_plan(folder_name, old_text, new_text, phrase)
++            except FileToolError as exc:
++                return f"File tools error: {exc}"
++        if action.kind == "rollback_bulk_replace":
++            try:
++                return self._file_tools().rollback_bulk_replace_commit()
++            except FileToolError as exc:
++                return f"File tools error: {exc}"
++        if action.kind == "backup_folder":
++            try:
++                result = backup_folder(action.target, self.folders_path, self.backup_root)
++            except BackupToolError as exc:
++                return f"Backup tool error: {exc}"
++            return (
++                f"Done: Backed up '{result.folder_name}' ({result.file_count} file(s)) "
++                f"to {result.destination}."
++            )
++        if action.kind == "clear_temp_files":
++            try:
++                matches = find_temp_files(action.target, self.folders_path)
++            except BackupToolError as exc:
++                return f"Backup tool error: {exc}"
++            if not matches:
++                return f"No temp-file clutter found in '{action.target}'. Nothing to clear."
++            tools = self._file_tools()
++            moved = 0
++            errors: list[str] = []
++            for match in matches:
++                try:
++                    tools.move_temp_pattern_file_to_trash(
++                        match.folder_name, match.relative_path, TEMP_FILE_PATTERNS
++                    )
++                    moved += 1
++                except FileToolError as exc:
++                    errors.append(f"{match.relative_path}: {exc}")
++            summary = f"Done: Moved {moved} temp file(s) in '{action.target}' to the assistant trash (reversible)."
++            if errors:
++                summary += f" {len(errors)} could not be moved: " + "; ".join(errors[:5])
++            return summary
+         if action.kind == "file_delete":
+             try:
+                 folder_name, relative_path = self._parse_pending_file_target(action.target)
+@@ -1102,6 +1275,224 @@ class LocalAssistant:
+             return f"Launch request error: {exc}"
+         return self._safety_snapshot_text(review_type="scripts-drift", drift_threshold=threshold)
+ 
++    def _allow_network_domain_text(self, domain_text: str) -> str:
++        try:
++            domains = add_allowed_domain(domain_text, self.network_allowlist_path)
++        except NetworkToolError as exc:
++            return f"Network tool error: {exc}"
++        return f"Added '{normalize_domain(domain_text)}' to the network fetch allowlist. Allowed domains: {', '.join(domains)}"
++
++    def _fetch_url_confirmation(self, url_text: str) -> AssistantResponse:
++        try:
++            clean_url = validate_fetch_url(url_text, self.network_allowlist_path)
++        except NetworkToolError as exc:
++            return AssistantResponse(f"Network tool error: {exc}")
++
++        action = PendingAction(
++            kind="network_fetch",
++            target=clean_url,
++            description=f"GET {clean_url} (read-only, allowlisted domain)",
++        )
++        return AssistantResponse(
++            f"Please confirm (allowlisted domain): {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _send_daily_summary_email_confirmation(self) -> AssistantResponse:
++        try:
++            config = load_notification_config(self.notification_config_path)
++        except NotificationConfigError as exc:
++            return AssistantResponse(f"Notification config error: {exc}")
++
++        if not config.enabled:
++            return AssistantResponse(
++                "Email notifications are disabled. Enable them by editing "
++                f"{self.notification_config_path} directly (this cannot be done through chat)."
++            )
++
++        body = self.tasks_store.summary()
++        preview = body if len(body) <= 200 else body[:200] + "..."
++
++        action = PendingAction(
++            kind="send_notification",
++            target=body,
++            description=(
++                f"Send an email to {config.recipient} (the one pre-approved, "
++                f"configured recipient) with your task summary: {preview}"
++            ),
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _commit_bulk_replace_confirmation(self, text: str) -> AssistantResponse:
++        folder_part, separator, phrase = text.rpartition(" confirm ")
++        if not separator:
++            return AssistantResponse(
++                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
++                "find <text> with <text> confirm <phrase>. Run 'backup bulk replace in <folder> "
++                "find <text> with <text>' first to see the required phrase."
++            )
++        folder_name, find_separator, remainder = folder_part.partition(" find ")
++        if not find_separator:
++            return AssistantResponse(
++                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
++                "find <text> with <text> confirm <phrase>"
++            )
++        old_text, with_separator, new_text = remainder.partition(" with ")
++        if not with_separator:
++            return AssistantResponse(
++                "File tools error: commit bulk replace expects: commit bulk replace in <folder> "
++                "find <text> with <text> confirm <phrase>"
++            )
++
++        tools = self._file_tools()
++        try:
++            tools.validate_bulk_replace_commit(folder_name, old_text, new_text, phrase.strip())
++        except FileToolError as exc:
++            return AssistantResponse(f"File tools error: {exc}")
++
++        required_phrase = tools.bulk_replace_required_confirmation_phrase(folder_name, old_text, new_text)
++
++        action = PendingAction(
++            kind="commit_bulk_replace",
++            target=f"{folder_name.strip()}\n{old_text.strip()}\n{new_text.strip()}\n{required_phrase}",
++            description=(
++                f"Apply bulk replace ('{old_text.strip()}' -> '{new_text.strip()}') to "
++                f"'{folder_name.strip()}' ({required_phrase}). A backup already exists and this can be rolled back."
++            ),
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _rollback_bulk_replace_confirmation(self) -> AssistantResponse:
++        action = PendingAction(
++            kind="rollback_bulk_replace",
++            target="",
++            description="Roll back the most recently applied bulk replace to its pre-apply state",
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _backup_folder_confirmation(self, folder_name: str) -> AssistantResponse:
++        folder_name = folder_name.strip()
++        if not folder_name:
++            return AssistantResponse("Backup expects: backup folder <name>, for example: backup folder downloads")
++
++        action = PendingAction(
++            kind="backup_folder",
++            target=folder_name,
++            description=f"Back up allowlisted folder '{folder_name}' to a new timestamped copy",
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _list_backups_text(self, folder_name: str | None) -> str:
++        records = list_backups(folder_name, self.backup_root)
++        if not records:
++            scope = f" for '{folder_name.strip()}'" if folder_name else ""
++            return f"No backups found{scope}."
++        lines = ["Backups:"]
++        for record in records[-20:]:
++            lines.append(
++                f"- {record.get('folder_name')}: {record.get('file_count')} file(s) at "
++                f"{record.get('created_at')} -> {record.get('destination')}"
++            )
++        return "\n".join(lines)
++
++    def _find_temp_files_text(self, folder_name: str) -> str:
++        try:
++            matches = find_temp_files(folder_name.strip(), self.folders_path)
++        except BackupToolError as exc:
++            return f"Backup tool error: {exc}"
++        if not matches:
++            return f"No temp-file clutter found in '{folder_name.strip()}'."
++        lines = [f"Temp-file clutter in '{folder_name.strip()}' ({len(matches)} file(s)):"]
++        for match in matches[:50]:
++            lines.append(f"- {match.relative_path} ({match.size_bytes} bytes)")
++        if len(matches) > 50:
++            lines.append(f"... and {len(matches) - 50} more.")
++        lines.append("\nTo move these to the assistant trash (reversible), say: clear temp files in " + folder_name.strip())
++        return "\n".join(lines)
++
++    def _clear_temp_files_confirmation(self, folder_name: str) -> AssistantResponse:
++        folder_name = folder_name.strip()
++        try:
++            matches = find_temp_files(folder_name, self.folders_path)
++        except BackupToolError as exc:
++            return AssistantResponse(f"Backup tool error: {exc}")
++        if not matches:
++            return AssistantResponse(f"No temp-file clutter found in '{folder_name}'. Nothing to clear.")
++
++        preview_lines = [f"{m.relative_path} ({m.size_bytes} bytes)" for m in matches[:20]]
++        preview = "; ".join(preview_lines)
++        if len(matches) > 20:
++            preview += f"; ... and {len(matches) - 20} more"
++
++        action = PendingAction(
++            kind="clear_temp_files",
++            target=folder_name,
++            description=(
++                f"Move {len(matches)} temp file(s) in '{folder_name}' to the assistant trash "
++                f"(reversible, not permanent deletion): {preview}"
++            ),
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _add_allowed_app_confirmation(self, text: str) -> AssistantResponse:
++        name, separator, target = text.partition(" at ")
++        if not separator or not name.strip() or not target.strip():
++            return AssistantResponse(
++                "Add app expects: add app <name> at <path>, for example: "
++                "add app steam at C:\\Program Files (x86)\\Steam\\Steam.exe"
++            )
++        try:
++            validate_app_target(target)
++        except ActionError as exc:
++            return AssistantResponse(f"Action error: {exc}")
++
++        action = PendingAction(
++            kind="add_allowed_app",
++            target=f"{name.strip()}\n{target.strip()}",
++            description=f"Add '{name.strip()}' to the allowed apps list -> {target.strip()}",
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
++    def _add_allowed_folder_confirmation(self, text: str) -> AssistantResponse:
++        name, separator, target = text.partition(" at ")
++        if not separator or not name.strip() or not target.strip():
++            return AssistantResponse(
++                "Add folder expects: add folder <name> at <path>, for example: "
++                "add folder projects at D:\\Projects"
++            )
++        try:
++            validate_folder_target(target)
++        except ActionError as exc:
++            return AssistantResponse(f"Action error: {exc}")
++
++        action = PendingAction(
++            kind="add_allowed_folder",
++            target=f"{name.strip()}\n{target.strip()}",
++            description=f"Add '{name.strip()}' to the allowed folders list -> {target.strip()}",
++        )
++        return AssistantResponse(
++            f"Please confirm: {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
+     def _shell_commands_text(self) -> str:
+         try:
+             return shell_commands_summary(self.shell_commands_path)
+@@ -2166,6 +2557,46 @@ class LocalAssistant:
+             return f"File tools error: {exc}"
+         return f"Restored file {entry_number}: {entry.display_text()}"
+ 
++    def _empty_trash_confirmation(self, days_text: str | None) -> AssistantResponse:
++        tools = self._file_tools()
++        try:
++            if days_text is None:
++                entries = list(enumerate(tools.list_file_trash(), start=1))
++                scope_label = "all"
++            else:
++                try:
++                    days = int(days_text.strip())
++                except ValueError:
++                    return AssistantResponse(
++                        "Empty trash expects: empty trash, or empty trash older than <N> days"
++                    )
++                entries = tools.trash_entries_older_than(days)
++                scope_label = f"older than {days} day(s)"
++        except FileToolError as exc:
++            return AssistantResponse(f"File tools error: {exc}")
++
++        if not entries:
++            return AssistantResponse(f"No trash entries ({scope_label}) to empty. Nothing to do.")
++
++        entry_numbers = [number for number, _entry in entries]
++        preview_lines = [f"{number}. {entry.display_text()}" for number, entry in entries[:20]]
++        preview = "; ".join(preview_lines)
++        if len(entries) > 20:
++            preview += f"; ... and {len(entries) - 20} more"
++
++        action = PendingAction(
++            kind="empty_trash",
++            target=",".join(str(n) for n in entry_numbers),
++            description=(
++                f"PERMANENTLY delete {len(entries)} trash entr{'y' if len(entries) == 1 else 'ies'} "
++                f"({scope_label}) -- this cannot be undone: {preview}"
++            ),
++        )
++        return AssistantResponse(
++            f"Please confirm (irreversible): {action.description}. Type 'yes' to continue.",
++            pending_action=action,
++        )
++
+     @staticmethod
+     def _pending_file_target(folder_name: str, relative_path: str) -> str:
+         return f"{folder_name}\n{relative_path}"
+diff --git a/assistant/file_tools.py b/assistant/file_tools.py
+index b9f662a..8cc423f 100644
+--- a/assistant/file_tools.py
++++ b/assistant/file_tools.py
+@@ -233,6 +233,50 @@ class AllowlistedFileTools:
+         self._write_file_trash(entries)
+         return entry
+ 
++    def move_temp_pattern_file_to_trash(
++        self, folder_name: str, relative_path: str, allowed_patterns: tuple[str, ...]
++    ) -> FileTrashEntry:
++        """Move a file matching a known temp-file pattern (*.tmp, Thumbs.db,
++        etc.) to the assistant trash, bypassing the general TEXT_EXTENSIONS
++        restriction used by move_file_to_trash().
++
++        This exists specifically for maintenance/cleanup flows: real temp
++        clutter is rarely a "common text file" (it's .tmp/.bak/Thumbs.db/
++        .DS_Store/etc.), so the stricter text-only check would otherwise
++        block clearing it. The safety net here is the explicit pattern
++        allowlist the caller must supply -- only files matching a known,
++        narrow junk-file pattern can go through this path, never an
++        arbitrary extension.
++        """
++        import fnmatch as _fnmatch
++
++        canonical_name, root = self._resolve_folder(folder_name)
++        file_path = self._resolve_file(root, relative_path)
++        self._reject_trash_storage_path(file_path)
++        if not any(_fnmatch.fnmatch(file_path.name, pattern) for pattern in allowed_patterns):
++            raise FileToolError(
++                f"'{relative_path}' does not match a known temp-file pattern; refusing to trash it."
++            )
++
++        entries = self.list_file_trash()
++        self.trash_dir.mkdir(parents=True, exist_ok=True)
++        trash_name = f"{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex}-{file_path.name}"
++        trash_path = self.trash_dir / trash_name
++        try:
++            shutil.move(str(file_path), trash_path)
++        except OSError as exc:
++            raise FileToolError(f"Could not move file to assistant trash: {relative_path}") from exc
++
++        entry = FileTrashEntry(
++            original_folder_name=canonical_name,
++            original_relative_path=_relative_text(file_path, root),
++            trash_path=str(trash_path),
++            deleted_at=_utc_now_iso(),
++        )
++        entries.append(entry)
++        self._write_file_trash(entries)
++        return entry
++
+     def validate_trash_candidate(self, folder_name: str, relative_path: str) -> Path:
+         """Return the resolved file path if it can be moved to assistant trash."""
+         _, root = self._resolve_folder(folder_name)
+@@ -311,6 +355,268 @@ class AllowlistedFileTools:
+         self._write_file_trash(entries)
+         return entry
+ 
++    def trash_entries_older_than(self, days: int) -> list[tuple[int, FileTrashEntry]]:
++        """Return (1-based entry_number, entry) pairs for trash items whose
++        deleted_at timestamp is older than the given number of days.
++        """
++        from datetime import datetime, timezone
++
++        cutoff = datetime.now(timezone.utc).timestamp() - (days * 86400)
++        results: list[tuple[int, FileTrashEntry]] = []
++        for index, entry in enumerate(self.list_file_trash(), start=1):
++            try:
++                deleted_at = datetime.strptime(entry.deleted_at, "%Y-%m-%dT%H:%M:%SZ").replace(
++                    tzinfo=timezone.utc
++                )
++            except ValueError:
++                continue
++            if deleted_at.timestamp() < cutoff:
++                results.append((index, entry))
++        return results
++
++    def purge_trash_entries(self, entry_numbers: list[int]) -> list[FileTrashEntry]:
++        """Permanently delete specific trash entries by 1-based entry number.
++
++        This is the one genuinely irreversible deletion path in the app. It
++        is reachable only as an explicit second step on items that are
++        already sitting in the reversible trash (i.e. the person already
++        confirmed removing them once) -- never a direct delete of a live
++        file. Callers are expected to have already shown the person exactly
++        which entries this will affect and gotten a fresh confirmation.
++        """
++        entries = self.list_file_trash()
++        if not entry_numbers:
++            raise FileToolError("No trash entries were specified to purge.")
++
++        unique_numbers = sorted(set(entry_numbers), reverse=True)
++        for number in unique_numbers:
++            if number < 1 or number > len(entries):
++                raise FileToolError(f"File trash number must be between 1 and {len(entries)}.")
++
++        purged: list[FileTrashEntry] = []
++        for number in unique_numbers:
++            entry = entries[number - 1]
++            trash_path = Path(entry.trash_path)
++            try:
++                if trash_path.exists():
++                    trash_path.unlink()
++            except OSError as exc:
++                raise FileToolError(f"Could not permanently delete: {entry.display_text()}") from exc
++            purged.append(entry)
++            del entries[number - 1]
++
++        self._write_file_trash(entries)
++        return purged
++
++    def bulk_replace_required_confirmation_phrase(
++        self,
++        folder_name: str,
++        old_text: str,
++        new_text: str,
++        limit: int = MAX_BULK_PLAN_ITEMS,
++    ) -> str:
++        """The exact phrase the operator must type back to commit this plan.
++
++        Deliberately derived from the live plan (folder + file count) so it
++        cannot be copy-pasted from a stale/different plan without the count
++        matching, and so the operator has to have actually looked at what
++        they're approving.
++        """
++        canonical_name, _root = self._resolve_folder(folder_name)
++        clean_old = " ".join(old_text.strip().split())
++        clean_new = " ".join(new_text.strip().split())
++        items = self.bulk_replace_plan(folder_name, clean_old, clean_new, limit=limit)
++        return f"apply {len(items)} files in {canonical_name}"
++
++    def validate_bulk_replace_commit(
++        self,
++        folder_name: str,
++        old_text: str,
++        new_text: str,
++        confirmation_phrase: str,
++        limit: int = MAX_BULK_PLAN_ITEMS,
++    ) -> tuple[Path, dict[str, object]]:
++        """Run every commit precondition without writing anything.
++
++        Returns (backup_dir, backup_manifest) if everything checks out, or
++        raises FileToolError describing exactly what's wrong. This is safe
++        to call eagerly (e.g. before even offering a confirmation prompt)
++        since it has no side effects, and is also re-run at actual commit
++        time as defense in depth against anything changing in between.
++        """
++        canonical_name, root = self._resolve_folder(folder_name)
++        clean_old = " ".join(old_text.strip().split())
++        clean_new = " ".join(new_text.strip().split())
++        if not clean_old:
++            raise FileToolError("Bulk replace commit needs text to find.")
++        if not clean_new:
++            raise FileToolError("Bulk replace commit needs replacement text.")
++
++        backup_dir, backup_manifest = self._latest_manifest(self.bulk_backup_dir)
++        if backup_manifest.get("kind") != "bulk_replace_backup":
++            raise FileToolError("No bulk replace backup found. Run a backup first.")
++        if backup_manifest.get("folder") != canonical_name:
++            raise FileToolError(
++                f"Latest backup is for folder '{backup_manifest.get('folder')}', not '{canonical_name}'. "
++                "Take a fresh backup for this folder first."
++            )
++        if backup_manifest.get("find") != clean_old or backup_manifest.get("replace_with") != clean_new:
++            raise FileToolError(
++                "Latest backup does not match this find/replace text. Take a fresh backup first."
++            )
++        if backup_manifest.get("apply_enabled"):
++            raise FileToolError("This backup has already been applied. Take a fresh backup to apply again.")
++
++        status, notes = _manifest_hash_status(backup_manifest, "Backup")
++        if status != "ok":
++            raise FileToolError(f"Backup manifest failed integrity check: {'; '.join(notes)}")
++
++        backup_files = backup_manifest.get("files")
++        if not isinstance(backup_files, list) or not backup_files:
++            raise FileToolError("Backup manifest has no files recorded.")
++
++        # Re-verify the live files on disk still match exactly what was
++        # backed up (no drift since the backup was taken) before writing
++        # anything.
++        for record in backup_files:
++            if not isinstance(record, dict):
++                raise FileToolError("Backup manifest is malformed.")
++            relative_path = record.get("relative_path")
++            expected_hash = record.get("source_sha256")
++            if not isinstance(relative_path, str) or not relative_path:
++                raise FileToolError("Backup manifest has an invalid file entry.")
++            live_path = self._resolve_file(root, relative_path)
++            if not live_path.exists():
++                raise FileToolError(
++                    f"File has changed since backup (now missing): {relative_path}. "
++                    "Take a fresh backup before committing."
++                )
++            live_hash = _file_metadata(live_path)["sha256"]
++            if live_hash != expected_hash:
++                raise FileToolError(
++                    f"File has changed since backup: {relative_path}. "
++                    "Take a fresh backup before committing."
++                )
++
++        required_phrase = self.bulk_replace_required_confirmation_phrase(
++            folder_name, clean_old, clean_new, limit=limit
++        )
++        if confirmation_phrase.strip() != required_phrase:
++            raise FileToolError(
++                f"Confirmation phrase did not match. Expected exactly: '{required_phrase}'"
++            )
++        if len(backup_files) != int(required_phrase.split()[1]):
++            raise FileToolError(
++                "The plan has changed since the backup was taken (different file count). "
++                "Take a fresh backup before committing."
++            )
++
++        return backup_dir, backup_manifest
++
++    def commit_bulk_replace_plan(
++        self,
++        folder_name: str,
++        old_text: str,
++        new_text: str,
++        confirmation_phrase: str,
++        limit: int = MAX_BULK_PLAN_ITEMS,
++    ) -> str:
++        """Actually apply a previously backed-up bulk replace plan.
++
++        Preconditions, all required (see validate_bulk_replace_commit):
++        1. A backup for this exact folder/find/replace already exists
++           (via backup_bulk_replace_plan), its manifest hash is intact, and
++           it has not already been applied.
++        2. The live files on disk right now match exactly what the backup
++           recorded (same files, same content hashes) -- if anything has
++           changed since the backup was taken, this refuses rather than
++           applying against a plan that's gone stale.
++        3. confirmation_phrase exactly matches the phrase computed fresh
++           from the current plan (see bulk_replace_required_confirmation_phrase).
++
++        On success, files are modified in place, but originals remain
++        recoverable via rollback_bulk_replace_commit() using this same
++        backup, since the backup copies are never deleted.
++        """
++        canonical_name, root = self._resolve_folder(folder_name)
++        clean_old = " ".join(old_text.strip().split())
++        clean_new = " ".join(new_text.strip().split())
++        backup_dir, backup_manifest = self.validate_bulk_replace_commit(
++            folder_name, old_text, new_text, confirmation_phrase, limit=limit
++        )
++        backup_files = backup_manifest["files"]
++
++        changed_files: list[str] = []
++        for record in backup_files:
++            relative_path = record["relative_path"]
++            live_path = self._resolve_file(root, relative_path)
++            try:
++                original_text = live_path.read_text(encoding="utf-8")
++                updated_text = original_text.replace(clean_old, clean_new)
++                live_path.write_text(updated_text, encoding="utf-8")
++            except OSError as exc:
++                raise FileToolError(f"Failed applying change to: {relative_path}") from exc
++            changed_files.append(relative_path)
++
++        backup_manifest["apply_enabled"] = True
++        backup_manifest["applied_at"] = _utc_now_iso()
++        self._write_bulk_backup_manifest(backup_dir, _annotate_manifest_hash(backup_manifest))
++
++        return (
++            f"Done: Applied bulk replace to {len(changed_files)} file(s) in '{canonical_name}'. "
++            f"Backup preserved at {backup_dir} for rollback."
++        )
++
++    def rollback_bulk_replace_commit(self) -> str:
++        """Restore files from the most recent applied bulk replace backup.
++
++        Only works on a backup that was actually committed
++        (apply_enabled=True) and has not already been rolled back, and
++        verifies each backed-up file's hash before restoring it.
++        """
++        backup_dir, backup_manifest = self._latest_manifest(self.bulk_backup_dir)
++        if backup_manifest.get("kind") != "bulk_replace_backup":
++            raise FileToolError("No bulk replace backup found to roll back.")
++        if not backup_manifest.get("apply_enabled"):
++            raise FileToolError("This backup was never applied, so there is nothing to roll back.")
++        if backup_manifest.get("rolled_back_at"):
++            raise FileToolError("This backup has already been rolled back.")
++
++        status, notes = _manifest_hash_status(backup_manifest, "Backup")
++        if status != "ok":
++            raise FileToolError(f"Backup manifest failed integrity check: {'; '.join(notes)}")
++
++        canonical_name = backup_manifest.get("folder")
++        if not isinstance(canonical_name, str):
++            raise FileToolError("Backup manifest is missing its folder name.")
++        _canonical_name, root = self._resolve_folder(canonical_name)
++
++        entries = _rollback_entries_from_backup_manifest(backup_manifest)
++        restored: list[str] = []
++        for entry in entries:
++            backup_relative_path = entry["backup_relative_path"]
++            restore_relative_path = entry["restore_relative_path"]
++            backup_file_path = backup_dir / "files" / backup_relative_path
++            expected_hash = entry.get("backup_sha256")
++            if not backup_file_path.exists():
++                raise FileToolError(f"Backup copy is missing, cannot restore: {backup_relative_path}")
++            actual_hash = _file_metadata(backup_file_path)["sha256"]
++            if expected_hash and actual_hash != expected_hash:
++                raise FileToolError(
++                    f"Backup copy integrity check failed for: {backup_relative_path}"
++                )
++            restore_target = self._resolve_file(root, restore_relative_path)
++            try:
++                shutil.copy2(backup_file_path, restore_target)
++            except OSError as exc:
++                raise FileToolError(f"Could not restore file: {restore_relative_path}") from exc
++            restored.append(restore_relative_path)
++
++        backup_manifest["rolled_back_at"] = _utc_now_iso()
++        self._write_bulk_backup_manifest(backup_dir, _annotate_manifest_hash(backup_manifest))
++
++        return f"Done: Rolled back {len(restored)} file(s) in '{canonical_name}' to their pre-apply state."
++
+     def search_files_summary(
+         self,
+         folder_name: str,
+diff --git a/assistant/network_tools.py b/assistant/network_tools.py
+new file mode 100644
+index 0000000..0d3d48d
+--- /dev/null
++++ b/assistant/network_tools.py
+@@ -0,0 +1,183 @@
++"""Read-only, GET-only network fetch tool with a strict domain allowlist.
++
++This module intentionally cannot send data anywhere. It can only issue a GET
++request to a URL whose host is already present in the local domain allowlist,
++and it returns a truncated, size-capped text preview of the response.
++
++It is NOT a general "send requests on your behalf" tool: there is no POST,
++no PUT, no DELETE, no custom headers/body, and no way to reach a host that
++was not explicitly allowlisted ahead of time.
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from pathlib import Path
++from urllib.parse import urlparse
++
++
++DEFAULT_NETWORK_ALLOWLIST_PATH = Path("config/network_allowlist.json")
++MAX_RESPONSE_CHARS = 4_000
++DEFAULT_TIMEOUT_SECONDS = 10
++MAX_CONTENT_BYTES = 2_000_000  # 2 MB hard cap read from the response
++
++
++class NetworkToolError(RuntimeError):
++    """Raised when a network fetch cannot be validated or completed safely."""
++
++
++@dataclass(frozen=True)
++class FetchResult:
++    url: str
++    status_code: int
++    content_type: str
++    body_preview: str
++    truncated: bool
++
++    def display_text(self) -> str:
++        lines = [
++            f"GET {self.url}",
++            f"Status: {self.status_code}",
++            f"Content-Type: {self.content_type or '(unknown)'}",
++            "",
++            self.body_preview,
++        ]
++        if self.truncated:
++            lines.append(f"\n(Response truncated at {MAX_RESPONSE_CHARS} character(s).)")
++        return "\n".join(lines)
++
++
++def default_network_allowlist() -> list[str]:
++    return []
++
++
++def normalize_domain(domain: str) -> str:
++    return domain.strip().lower().lstrip("www.")
++
++
++def load_network_allowlist(path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> list[str]:
++    allowlist_path = Path(path)
++    if not allowlist_path.exists():
++        return default_network_allowlist()
++    try:
++        raw = json.loads(allowlist_path.read_text(encoding="utf-8-sig"))
++    except json.JSONDecodeError as exc:
++        raise NetworkToolError(f"Invalid network allowlist JSON: {allowlist_path}") from exc
++    except OSError as exc:
++        raise NetworkToolError(f"Could not read network allowlist: {allowlist_path}") from exc
++
++    if not isinstance(raw, dict) or not isinstance(raw.get("allowed_domains"), list):
++        raise NetworkToolError("Network allowlist must contain an 'allowed_domains' array.")
++
++    domains: list[str] = []
++    for item in raw["allowed_domains"]:
++        if not isinstance(item, str) or not item.strip():
++            raise NetworkToolError("Network allowlist domains must be non-empty strings.")
++        domains.append(normalize_domain(item))
++    return domains
++
++
++def save_network_allowlist(domains: list[str], path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> None:
++    allowlist_path = Path(path)
++    allowlist_path.parent.mkdir(parents=True, exist_ok=True)
++    payload = {"allowed_domains": sorted({normalize_domain(d) for d in domains})}
++    allowlist_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
++
++
++def add_allowed_domain(domain: str, path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> list[str]:
++    clean_domain = normalize_domain(domain)
++    if not clean_domain:
++        raise NetworkToolError("Domain cannot be empty.")
++    domains = load_network_allowlist(path)
++    if clean_domain not in domains:
++        domains.append(clean_domain)
++    save_network_allowlist(domains, path)
++    return domains
++
++
++def validate_fetch_url(url: str, allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> str:
++    """Validate a URL is https/http, well-formed, and on the domain allowlist.
++
++    Returns the cleaned URL if valid, otherwise raises NetworkToolError.
++    """
++    clean_url = url.strip()
++    if not clean_url:
++        raise NetworkToolError("URL cannot be empty.")
++
++    parsed = urlparse(clean_url)
++    if parsed.scheme not in {"http", "https"}:
++        raise NetworkToolError("Only http:// and https:// URLs can be fetched.")
++    if not parsed.netloc:
++        raise NetworkToolError("URL must include a host, e.g. https://example.com/page")
++
++    host = normalize_domain(parsed.hostname or "")
++    allowlist = load_network_allowlist(allowlist_path)
++    if not allowlist:
++        raise NetworkToolError(
++            "No domains are allowlisted for network fetch yet. "
++            "Add one first, e.g.: allow network domain example.com"
++        )
++    if host not in allowlist:
++        raise NetworkToolError(
++            f"'{host}' is not on the network allowlist. "
++            f"Allowed domains: {', '.join(allowlist)}"
++        )
++    return clean_url
++
++
++def fetch_url(
++    url: str,
++    allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH,
++    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
++) -> FetchResult:
++    """Perform a read-only GET request to an allowlisted URL.
++
++    Raises NetworkToolError if the URL is not valid/allowlisted, or if the
++    request fails.
++    """
++    clean_url = validate_fetch_url(url, allowlist_path)
++
++    request = urllib.request.Request(clean_url, method="GET")
++    try:
++        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
++            status_code = response.status
++            content_type = response.headers.get("Content-Type", "")
++            raw_body = response.read(MAX_CONTENT_BYTES + 1)
++    except urllib.error.HTTPError as exc:
++        raise NetworkToolError(f"Request failed with HTTP {exc.code}: {exc.reason}") from exc
++    except urllib.error.URLError as exc:
++        raise NetworkToolError(f"Request failed: {exc.reason}") from exc
++    except OSError as exc:
++        raise NetworkToolError(f"Request failed: {exc}") from exc
++
++    content_truncated_by_size = len(raw_body) > MAX_CONTENT_BYTES
++    if content_truncated_by_size:
++        raw_body = raw_body[:MAX_CONTENT_BYTES]
++
++    try:
++        text_body = raw_body.decode("utf-8", errors="replace")
++    except Exception:  # pragma: no cover - decode with errors="replace" should not raise
++        text_body = ""
++
++    truncated = content_truncated_by_size or len(text_body) > MAX_RESPONSE_CHARS
++    preview = text_body[:MAX_RESPONSE_CHARS]
++
++    return FetchResult(
++        url=clean_url,
++        status_code=status_code,
++        content_type=content_type,
++        body_preview=preview,
++        truncated=truncated,
++    )
++
++
++def network_allowlist_summary(path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> str:
++    domains = load_network_allowlist(path)
++    if not domains:
++        return "Network fetch allowlist: empty. Add a domain with: allow network domain <domain>"
++    lines = ["Network fetch allowlist (GET-only):"]
++    lines.extend(f"- {domain}" for domain in domains)
++    return "\n".join(lines)
+diff --git a/assistant/notifications.py b/assistant/notifications.py
+new file mode 100644
+index 0000000..d21cc97
+--- /dev/null
++++ b/assistant/notifications.py
+@@ -0,0 +1,189 @@
++"""A single, deliberately narrow, pre-approved outbound email notification.
++
++This is NOT a general "send messages/emails to anyone" capability. By
++design:
++- There is exactly one recipient, one subject template, and one SMTP
++  account, all set once via a local config file
++  (config/notification_config.json) that must be edited directly on disk.
++- There is no conversational command anywhere in this app that can set or
++  change the recipient, subject, or SMTP host. If there were, that would
++  reopen the "send arbitrary things to arbitrary people" risk this design
++  exists to avoid.
++- The SMTP password is never stored in the config file. It is read from an
++  environment variable whose *name* is stored in the config
++  (smtp_password_env_var), so the actual secret lives outside the repo and
++  outside anything the assistant ever writes.
++- Sending is disabled by default (`enabled: false`) and requires the
++  person to explicitly opt in by editing the config file themselves.
++- Every send still goes through the normal PendingAction confirmation flow
++  in core.py before anything is actually sent.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import smtplib
++from dataclasses import dataclass
++from email.message import EmailMessage
++from pathlib import Path
++
++
++DEFAULT_NOTIFICATION_CONFIG_PATH = Path("config/notification_config.json")
++DEFAULT_SMTP_PORT = 587
++DEFAULT_SMTP_TIMEOUT_SECONDS = 15
++
++
++class NotificationConfigError(RuntimeError):
++    """Raised when the notification config is missing, incomplete, or disabled."""
++
++
++@dataclass(frozen=True)
++class NotificationConfig:
++    enabled: bool = False
++    recipient: str = ""
++    subject_template: str = "Assistant Notification"
++    smtp_host: str = ""
++    smtp_port: int = DEFAULT_SMTP_PORT
++    smtp_username: str = ""
++    smtp_password_env_var: str = "ASSISTANT_SMTP_PASSWORD"
++    use_tls: bool = True
++
++
++def default_notification_config_payload() -> dict[str, object]:
++    return {
++        "enabled": False,
++        "recipient": "",
++        "subject_template": "Assistant Notification",
++        "smtp_host": "",
++        "smtp_port": DEFAULT_SMTP_PORT,
++        "smtp_username": "",
++        "smtp_password_env_var": "ASSISTANT_SMTP_PASSWORD",
++        "use_tls": True,
++    }
++
++
++def load_notification_config(
++    path: str | Path = DEFAULT_NOTIFICATION_CONFIG_PATH,
++) -> NotificationConfig:
++    config_path = Path(path)
++    if not config_path.exists():
++        return NotificationConfig()
++
++    try:
++        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
++    except json.JSONDecodeError as exc:
++        raise NotificationConfigError(f"Invalid notification config JSON: {config_path}") from exc
++    except OSError as exc:
++        raise NotificationConfigError(f"Could not read notification config: {config_path}") from exc
++
++    if not isinstance(raw, dict):
++        raise NotificationConfigError("Notification config must be a JSON object.")
++
++    defaults = default_notification_config_payload()
++    merged = {**defaults, **raw}
++
++    return NotificationConfig(
++        enabled=bool(merged.get("enabled", False)),
++        recipient=str(merged.get("recipient", "")).strip(),
++        subject_template=str(merged.get("subject_template", defaults["subject_template"])),
++        smtp_host=str(merged.get("smtp_host", "")).strip(),
++        smtp_port=int(merged.get("smtp_port", DEFAULT_SMTP_PORT)),
++        smtp_username=str(merged.get("smtp_username", "")).strip(),
++        smtp_password_env_var=str(
++            merged.get("smtp_password_env_var", "ASSISTANT_SMTP_PASSWORD")
++        ).strip()
++        or "ASSISTANT_SMTP_PASSWORD",
++        use_tls=bool(merged.get("use_tls", True)),
++    )
++
++
++def notification_config_summary(path: str | Path = DEFAULT_NOTIFICATION_CONFIG_PATH) -> str:
++    """Safe, password-free summary of the current notification config."""
++    try:
++        config = load_notification_config(path)
++    except NotificationConfigError as exc:
++        return f"Notification config error: {exc}"
++
++    if not config.enabled:
++        return (
++            "Email notifications are disabled. To enable, edit "
++            f"{Path(path)} directly (recipient, subject_template, smtp_host, "
++            "smtp_port, smtp_username, smtp_password_env_var, enabled: true), "
++            "and set the SMTP password in the environment variable named in "
++            "smtp_password_env_var. This cannot be configured through chat."
++        )
++    return (
++        "Email notifications: enabled\n"
++        f"Recipient: {config.recipient or '(not set)'}\n"
++        f"Subject template: {config.subject_template}\n"
++        f"SMTP host: {config.smtp_host or '(not set)'}:{config.smtp_port}\n"
++        f"SMTP username: {config.smtp_username or '(not set)'}\n"
++        f"Password read from environment variable: {config.smtp_password_env_var}"
++    )
++
++
++def _validate_ready_to_send(config: NotificationConfig) -> None:
++    if not config.enabled:
++        raise NotificationConfigError(
++            "Email notifications are disabled. Enable them by editing "
++            f"{DEFAULT_NOTIFICATION_CONFIG_PATH} directly; this cannot be done through chat."
++        )
++    missing = [
++        field_name
++        for field_name, value in (
++            ("recipient", config.recipient),
++            ("smtp_host", config.smtp_host),
++            ("smtp_username", config.smtp_username),
++        )
++        if not value
++    ]
++    if missing:
++        raise NotificationConfigError(
++            f"Notification config is incomplete, missing: {', '.join(missing)}. "
++            f"Edit {DEFAULT_NOTIFICATION_CONFIG_PATH} directly to set them."
++        )
++    if not os.environ.get(config.smtp_password_env_var):
++        raise NotificationConfigError(
++            f"SMTP password environment variable '{config.smtp_password_env_var}' is not set."
++        )
++
++
++def send_configured_notification(
++    body: str,
++    config_path: str | Path = DEFAULT_NOTIFICATION_CONFIG_PATH,
++    subject_suffix: str | None = None,
++) -> str:
++    """Send an email to the single pre-approved, config-defined recipient.
++
++    The recipient, subject template, and SMTP account all come from the
++    config file only -- none of them can be supplied by the caller. The
++    caller may only supply the message body (and an optional short subject
++    suffix, e.g. a date), never the destination.
++    """
++    config = load_notification_config(config_path)
++    _validate_ready_to_send(config)
++
++    password = os.environ[config.smtp_password_env_var]
++    subject = config.subject_template
++    if subject_suffix:
++        subject = f"{subject} - {subject_suffix}"
++
++    message = EmailMessage()
++    message["From"] = config.smtp_username
++    message["To"] = config.recipient
++    message["Subject"] = subject
++    message.set_content(body)
++
++    try:
++        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=DEFAULT_SMTP_TIMEOUT_SECONDS) as server:
++            if config.use_tls:
++                server.starttls()
++            server.login(config.smtp_username, password)
++            server.send_message(message)
++    except smtplib.SMTPException as exc:
++        raise NotificationConfigError(f"Failed to send notification email: {exc}") from exc
++    except OSError as exc:
++        raise NotificationConfigError(f"Failed to connect to SMTP server: {exc}") from exc
++
++    return f"Sent notification email to {config.recipient} (subject: {subject})."
+diff --git a/tests/test_actions.py b/tests/test_actions.py
+index f99d135..7cd56b7 100644
+--- a/tests/test_actions.py
++++ b/tests/test_actions.py
+@@ -1,4 +1,5 @@
+ ﻿import tempfile
++import json
+ import unittest
+ from pathlib import Path
+ from unittest.mock import patch
+@@ -118,6 +119,39 @@ class ActionTests(unittest.TestCase):
+ 
+         self.assertEqual(Path(folders["workspace"]), folder)
+ 
++    def test_add_allowed_folder_succeeds_even_with_stale_existing_entries(self) -> None:
++        """Regression test: a single stale/invalid pre-existing folder entry
++        (e.g. a moved directory or disconnected network drive) must not
++        block adding a brand new, valid folder.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            folder = Path(temp_dir) / "workspace"
++            folder.mkdir()
++            path = Path(temp_dir) / "folders.json"
++            path.write_text(
++                json.dumps(
++                    {
++                        "folders": {
++                            "stale": str(Path(temp_dir) / "does-not-exist-anymore"),
++                        }
++                    }
++                ),
++                encoding="utf-8",
++            )
++
++            add_allowed_folder("workspace", str(folder), path)
++            folders = load_allowed_folders(path)
++
++        self.assertEqual(Path(folders["workspace"]), folder)
++        self.assertNotIn("stale", folders)
++
++    def test_add_allowed_folder_rejects_genuinely_invalid_new_target(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "folders.json"
++
++            with self.assertRaises(ActionError):
++                add_allowed_folder("ghost", str(Path(temp_dir) / "nonexistent-xyz"), path)
++
+     def test_rejects_folder_shell_control_characters(self) -> None:
+         with tempfile.TemporaryDirectory() as temp_dir:
+             path = Path(temp_dir) / "folders.json"
+diff --git a/tests/test_backup_maintenance_workflow.py b/tests/test_backup_maintenance_workflow.py
+new file mode 100644
+index 0000000..0c6e125
+--- /dev/null
++++ b/tests/test_backup_maintenance_workflow.py
+@@ -0,0 +1,182 @@
++"""Tests for the named backup/maintenance workflow.
++
++These operations are implemented as plain Python file operations (no
++subprocess/shell involved at all), scoped strictly to the existing folder
++allowlist, with all "deletion" going through the reversible assistant trash.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++
++from assistant.actions import save_allowed_folders
++from assistant.backup_tools import (
++    BackupToolError,
++    backup_folder,
++    find_temp_files,
++    list_backups,
++)
++from assistant.core import LocalAssistant
++
++
++class BackupToolsTests(unittest.TestCase):
++    def _make_workspace(self, temp_dir: str) -> tuple[Path, Path, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello", encoding="utf-8")
++        (source / "notes.tmp").write_text("junk", encoding="utf-8")
++        (source / "Thumbs.db").write_text("junk", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        return root, source, folders_path
++
++    def test_backup_folder_copies_without_modifying_source(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root, source, folders_path = self._make_workspace(temp_dir)
++            backup_root = root / "backups"
++
++            result = backup_folder("docs", folders_path, backup_root)
++
++            self.assertEqual(result.file_count, 3)
++            dest_files = sorted(p.name for p in Path(result.destination).rglob("*") if p.is_file())
++            self.assertEqual(dest_files, ["Thumbs.db", "a.txt", "notes.tmp"])
++            # Source must be untouched.
++            source_files = sorted(p.name for p in source.rglob("*") if p.is_file())
++            self.assertEqual(source_files, ["Thumbs.db", "a.txt", "notes.tmp"])
++
++    def test_backup_folder_rejects_unallowlisted_name(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root, _source, folders_path = self._make_workspace(temp_dir)
++            with self.assertRaises(BackupToolError):
++                backup_folder("not-a-real-folder", folders_path, root / "backups")
++
++    def test_list_backups_reflects_recorded_backups(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root, _source, folders_path = self._make_workspace(temp_dir)
++            backup_root = root / "backups"
++            backup_folder("docs", folders_path, backup_root)
++
++            records = list_backups("docs", backup_root)
++            self.assertEqual(len(records), 1)
++            self.assertEqual(records[0]["folder_name"], "docs")
++
++    def test_find_temp_files_only_matches_known_junk_patterns(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            _root, _source, folders_path = self._make_workspace(temp_dir)
++            matches = find_temp_files("docs", folders_path)
++            names = sorted(m.relative_path for m in matches)
++            self.assertEqual(names, ["Thumbs.db", "notes.tmp"])
++            # a.txt must never be flagged as temp clutter.
++            self.assertNotIn("a.txt", names)
++
++
++class BackupMaintenanceCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> tuple[LocalAssistant, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello", encoding="utf-8")
++        (source / "notes.tmp").write_text("junk", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        assistant = LocalAssistant(
++            use_llm=False,
++            folders_path=folders_path,
++            backup_root=root / "backups",
++            data_export_dir=root / "exports",
++            file_trash_dir=root / "file-trash",
++            file_trash_manifest_path=root / "file-trash-manifest.json",
++        )
++        return assistant, source
++
++    def test_backup_folder_command_does_not_collide_with_bulk_backup_commands(self) -> None:
++        """Regression test: 'backup folder <name>' must not shadow the
++        pre-existing 'backup bulk replace/rename in ...' commands.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++
++            bulk_response = assistant.respond(
++                "backup bulk replace in docs find hello with goodbye"
++            )
++            folder_response = assistant.respond("backup folder docs")
++
++            self.assertNotEqual(bulk_response.text, folder_response.text)
++            assert folder_response.pending_action is not None
++            self.assertEqual(folder_response.pending_action.kind, "backup_folder")
++
++    def test_folder_backups_command_does_not_collide_with_data_export_backups(self) -> None:
++        """Regression test: 'list folder backups'/'folder backups' must not
++        shadow the pre-existing data-export 'backups'/'list backups' command.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++
++            data_export_response = assistant.respond("backups")
++            self.assertNotIn("No backups found", data_export_response.text)
++
++    def test_backup_folder_end_to_end(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++
++            response = assistant.respond("backup folder docs")
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "backup_folder")
++
++            result = assistant.confirm_pending_action(response.pending_action)
++            self.assertIn("Done: Backed up 'docs'", result)
++
++            listing = assistant.respond("list folder backups docs")
++            self.assertIn("docs", listing.text)
++
++    def test_clear_temp_files_moves_to_reversible_trash_not_permanent_delete(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, source = self._make_assistant(temp_dir)
++
++            find_response = assistant.respond("find temp files in docs")
++            self.assertIn("notes.tmp", find_response.text)
++
++            clear_response = assistant.respond("clear temp files in docs")
++            self.assertIsNotNone(clear_response.pending_action)
++            assert clear_response.pending_action is not None
++            self.assertEqual(clear_response.pending_action.kind, "clear_temp_files")
++            self.assertIn("reversible", clear_response.text)
++            self.assertIn("not permanent deletion", clear_response.text)
++
++            result = assistant.confirm_pending_action(clear_response.pending_action)
++            self.assertIn("Done: Moved 1 temp file", result)
++
++            # The temp file must be gone from the source folder...
++            self.assertFalse((source / "notes.tmp").exists())
++            self.assertTrue((source / "a.txt").exists())
++            # ...but recoverable from the assistant trash, not permanently deleted.
++            trash_entries = assistant._file_tools().list_file_trash()
++            self.assertEqual(len(trash_entries), 1)
++            self.assertTrue(Path(trash_entries[0].trash_path).exists())
++
++    def test_clear_temp_files_with_no_matches_does_not_create_pending_action(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root = Path(temp_dir)
++            source = root / "clean"
++            source.mkdir()
++            (source / "a.txt").write_text("hello", encoding="utf-8")
++            folders_path = root / "folders.json"
++            save_allowed_folders({"clean": str(source)}, folders_path)
++            assistant = LocalAssistant(
++                use_llm=False,
++                folders_path=folders_path,
++                backup_root=root / "backups",
++                data_export_dir=root / "exports",
++            )
++
++            response = assistant.respond("clear temp files in clean")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Nothing to clear", response.text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_bulk_replace_commit_workflow.py b/tests/test_bulk_replace_commit_workflow.py
+new file mode 100644
+index 0000000..5541dc9
+--- /dev/null
++++ b/tests/test_bulk_replace_commit_workflow.py
+@@ -0,0 +1,242 @@
++"""Tests for the real bulk-replace commit and rollback workflow.
++
++Key invariants under test:
++- Commit is impossible without a matching, hash-intact prior backup.
++- Commit requires an exact confirmation phrase computed fresh from the live
++  plan (proving the operator read and understood the scope).
++- Commit refuses if live files have drifted from what was backed up.
++- Every commit remains reversible via rollback, which restores original
++  content and verifies backup integrity before restoring.
++- Double-apply and double-rollback are both rejected.
++- The confirmation-phrase gate fails fast (no pending action created) before
++  offering the standard 'yes' confirmation step.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++
++from assistant.actions import save_allowed_folders
++from assistant.core import LocalAssistant
++from assistant.file_tools import AllowlistedFileTools, FileToolError
++
++
++class BulkReplaceCommitUnitTests(unittest.TestCase):
++    def _tools(self, temp_dir: str) -> tuple[AllowlistedFileTools, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello world hello", encoding="utf-8")
++        (source / "b.txt").write_text("hello there", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        tools = AllowlistedFileTools(
++            folders_path=folders_path,
++            trash_dir=root / "trash",
++            manifest_path=root / "trash-manifest.json",
++            bulk_backup_dir=root / "bulk-backups",
++            bulk_approval_dir=root / "bulk-approvals",
++            bulk_review_dir=root / "bulk-reviews",
++            bulk_rollback_dir=root / "bulk-rollbacks",
++            bulk_preflight_dir=root / "bulk-preflights",
++            bulk_checklist_dir=root / "bulk-checklists",
++        )
++        return tools, source
++
++    def test_commit_blocked_without_prior_backup(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            with self.assertRaises(FileToolError):
++                tools.commit_bulk_replace_plan("docs", "hello", "goodbye", "apply 2 files in docs")
++
++    def test_commit_blocked_with_wrong_confirmation_phrase(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            with self.assertRaises(FileToolError) as ctx:
++                tools.commit_bulk_replace_plan("docs", "hello", "goodbye", "not the right phrase")
++            self.assertIn("Confirmation phrase did not match", str(ctx.exception))
++
++    def test_required_phrase_reflects_actual_file_count(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            self.assertEqual(phrase, "apply 2 files in docs")
++
++    def test_commit_succeeds_with_correct_phrase_and_writes_files(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++
++            result = tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++
++            self.assertIn("Applied bulk replace to 2 file(s)", result)
++            self.assertEqual((source / "a.txt").read_text(encoding="utf-8"), "goodbye world goodbye")
++            self.assertEqual((source / "b.txt").read_text(encoding="utf-8"), "goodbye there")
++
++    def test_commit_blocked_on_double_apply(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++
++            with self.assertRaises(FileToolError) as ctx:
++                tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++            self.assertIn("already been applied", str(ctx.exception))
++
++    def test_commit_blocked_when_file_drifted_since_backup(self) -> None:
++        """Regression test: if a file changes after the backup was taken but
++        before commit, the commit must refuse rather than apply blindly --
++        and must not modify the drifted file at all.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++
++            (source / "a.txt").write_text("hello world -- edited externally!", encoding="utf-8")
++
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            with self.assertRaises(FileToolError) as ctx:
++                tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++            self.assertIn("changed since backup", str(ctx.exception))
++            # The drifted file must be untouched by the failed commit attempt.
++            self.assertEqual(
++                (source / "a.txt").read_text(encoding="utf-8"), "hello world -- edited externally!"
++            )
++
++    def test_rollback_restores_original_content(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++
++            result = tools.rollback_bulk_replace_commit()
++
++            self.assertIn("Rolled back 2 file(s)", result)
++            self.assertEqual((source / "a.txt").read_text(encoding="utf-8"), "hello world hello")
++            self.assertEqual((source / "b.txt").read_text(encoding="utf-8"), "hello there")
++
++    def test_rollback_blocked_if_never_applied(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++
++            with self.assertRaises(FileToolError) as ctx:
++                tools.rollback_bulk_replace_commit()
++            self.assertIn("never applied", str(ctx.exception))
++
++    def test_rollback_blocked_on_double_rollback(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
++            tools.rollback_bulk_replace_commit()
++
++            with self.assertRaises(FileToolError) as ctx:
++                tools.rollback_bulk_replace_commit()
++            self.assertIn("already been rolled back", str(ctx.exception))
++
++    def test_validate_bulk_replace_commit_is_side_effect_free(self) -> None:
++        """The eager validation helper must never write to disk, so it's
++        safe to call before offering a confirmation prompt.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, source = self._tools(temp_dir)
++            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
++            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
++            before = (source / "a.txt").read_text(encoding="utf-8")
++
++            tools.validate_bulk_replace_commit("docs", "hello", "goodbye", phrase)
++
++            after = (source / "a.txt").read_text(encoding="utf-8")
++            self.assertEqual(before, after)
++
++
++class BulkReplaceCommitCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> tuple[LocalAssistant, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello world", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        assistant = LocalAssistant(
++            use_llm=False,
++            folders_path=folders_path,
++            data_export_dir=root / "exports",
++        )
++        return assistant, source
++
++    def test_commit_command_fails_fast_without_backup_no_pending_action(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            response = assistant.respond(
++                "commit bulk replace in docs find hello with goodbye confirm apply 1 files in docs"
++            )
++            self.assertIsNone(response.pending_action)
++            self.assertIn("File tools error", response.text)
++
++    def test_commit_command_fails_fast_with_wrong_phrase_no_pending_action(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            assistant.respond("backup bulk replace in docs find hello with goodbye")
++
++            response = assistant.respond(
++                "commit bulk replace in docs find hello with goodbye confirm nonsense phrase"
++            )
++            self.assertIsNone(response.pending_action)
++            self.assertIn("did not match", response.text)
++
++    def test_commit_end_to_end_then_rollback(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, source = self._make_assistant(temp_dir)
++            assistant.respond("backup bulk replace in docs find hello with goodbye")
++
++            response = assistant.respond(
++                "commit bulk replace in docs find hello with goodbye confirm apply 1 files in docs"
++            )
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "commit_bulk_replace")
++
++            result = assistant.confirm_pending_action(response.pending_action)
++            self.assertIn("Applied bulk replace to 1 file(s)", result)
++            self.assertEqual((source / "a.txt").read_text(encoding="utf-8"), "goodbye world")
++
++            rollback_response = assistant.respond("rollback bulk replace")
++            self.assertIsNotNone(rollback_response.pending_action)
++            assert rollback_response.pending_action is not None
++            self.assertEqual(rollback_response.pending_action.kind, "rollback_bulk_replace")
++
++            rollback_result = assistant.confirm_pending_action(rollback_response.pending_action)
++            self.assertIn("Rolled back 1 file(s)", rollback_result)
++            self.assertEqual((source / "a.txt").read_text(encoding="utf-8"), "hello world")
++
++    def test_commit_never_writes_files_before_final_yes_confirmation(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, source = self._make_assistant(temp_dir)
++            assistant.respond("backup bulk replace in docs find hello with goodbye")
++
++            assistant.respond(
++                "commit bulk replace in docs find hello with goodbye confirm apply 1 files in docs"
++            )
++            # Only respond() was called (no confirm_pending_action yet) --
++            # the file must still be untouched.
++            self.assertEqual((source / "a.txt").read_text(encoding="utf-8"), "hello world")
++
++    def test_malformed_commit_command_gives_helpful_error(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            response = assistant.respond("commit bulk replace in docs missing keywords")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("commit bulk replace in <folder>", response.text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_empty_trash_workflow.py b/tests/test_empty_trash_workflow.py
+new file mode 100644
+index 0000000..3e0faa0
+--- /dev/null
++++ b/tests/test_empty_trash_workflow.py
+@@ -0,0 +1,161 @@
++"""Tests for the explicit, confirmation-gated "empty trash" workflow.
++
++Permanent deletion in this app has exactly one entry point:
++purge_trash_entries(), reachable only via the "empty trash" /
++"empty trash older than N days" commands, and only for items that are
++already sitting in the reversible assistant trash (i.e. the person already
++confirmed removing them once, as a normal delete-to-trash). It always
++requires a second, explicit confirmation that previews exactly what will be
++permanently removed.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import unittest
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++
++from assistant.actions import save_allowed_folders
++from assistant.core import LocalAssistant
++from assistant.file_tools import AllowlistedFileTools, FileToolError
++
++
++class EmptyTrashCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> tuple[LocalAssistant, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello", encoding="utf-8")
++        (source / "b.txt").write_text("world", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        assistant = LocalAssistant(
++            use_llm=False,
++            folders_path=folders_path,
++            file_trash_dir=root / "trash",
++            file_trash_manifest_path=root / "trash-manifest.json",
++            data_export_dir=root / "exports",
++        )
++        return assistant, source
++
++    def test_empty_trash_with_nothing_in_trash_has_no_pending_action(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            response = assistant.respond("empty trash")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Nothing to do", response.text)
++
++    def test_empty_trash_requires_confirmation_and_previews_contents(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            delete_response = assistant.respond("delete file in docs a.txt")
++            assistant.confirm_pending_action(delete_response.pending_action)
++
++            response = assistant.respond("empty trash")
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "empty_trash")
++            self.assertIn("PERMANENTLY", response.text)
++            self.assertIn("cannot be undone", response.text)
++            self.assertIn("docs/a.txt", response.text)
++
++    def test_empty_trash_end_to_end_permanently_removes_file(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            delete_response = assistant.respond("delete file in docs a.txt")
++            assistant.confirm_pending_action(delete_response.pending_action)
++
++            tools = assistant._file_tools()
++            trash_entries = tools.list_file_trash()
++            self.assertEqual(len(trash_entries), 1)
++            trash_path = Path(trash_entries[0].trash_path)
++            self.assertTrue(trash_path.exists())
++
++            empty_response = assistant.respond("empty trash")
++            result = assistant.confirm_pending_action(empty_response.pending_action)
++
++            self.assertIn("Permanently deleted 1 trash entry", result)
++            self.assertFalse(trash_path.exists())
++            self.assertEqual(tools.list_file_trash(), [])
++
++    def test_empty_trash_only_affects_specified_entries_not_all_files(self) -> None:
++        """A file that was never moved to trash must never be touched by
++        empty trash, even if it lives in the same allowlisted folder.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, source = self._make_assistant(temp_dir)
++            delete_response = assistant.respond("delete file in docs a.txt")
++            assistant.confirm_pending_action(delete_response.pending_action)
++
++            empty_response = assistant.respond("empty trash")
++            assistant.confirm_pending_action(empty_response.pending_action)
++
++            # b.txt was never deleted/trashed and must be untouched.
++            self.assertTrue((source / "b.txt").exists())
++
++    def test_empty_trash_older_than_days_only_selects_old_entries(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            delete_response = assistant.respond("delete file in docs a.txt")
++            assistant.confirm_pending_action(delete_response.pending_action)
++
++            # A freshly trashed entry is not older than 30 days.
++            response = assistant.respond("empty trash older than 30 days")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Nothing to do", response.text)
++
++            # But it is older than -1 days (i.e. everything qualifies).
++            response = assistant.respond("empty trash older than 0 days")
++            self.assertIsNotNone(response.pending_action)
++
++    def test_empty_trash_malformed_days_argument_gives_helpful_error(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant, _source = self._make_assistant(temp_dir)
++            response = assistant.respond("empty trash older than banana days")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("empty trash", response.text.lower())
++
++
++class PurgeTrashEntriesUnitTests(unittest.TestCase):
++    def _tools(self, temp_dir: str) -> tuple[AllowlistedFileTools, Path]:
++        root = Path(temp_dir)
++        source = root / "docs"
++        source.mkdir()
++        (source / "a.txt").write_text("hello", encoding="utf-8")
++        folders_path = root / "folders.json"
++        save_allowed_folders({"docs": str(source)}, folders_path)
++        tools = AllowlistedFileTools(
++            folders_path=folders_path,
++            trash_dir=root / "trash",
++            manifest_path=root / "trash-manifest.json",
++        )
++        return tools, source
++
++    def test_purge_requires_at_least_one_entry_number(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            with self.assertRaises(FileToolError):
++                tools.purge_trash_entries([])
++
++    def test_purge_rejects_out_of_range_entry_number(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.move_file_to_trash("docs", "a.txt")
++            with self.assertRaises(FileToolError):
++                tools.purge_trash_entries([5])
++
++    def test_trash_entries_older_than_uses_deleted_at_timestamp(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            tools, _source = self._tools(temp_dir)
++            tools.move_file_to_trash("docs", "a.txt")
++
++            # Not older than 30 days yet.
++            self.assertEqual(tools.trash_entries_older_than(30), [])
++            # Older than -1 days (i.e. any positive-in-the-past cutoff) matches.
++            matches = tools.trash_entries_older_than(0)
++            self.assertEqual(len(matches), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_network_and_allowlist_workflow.py b/tests/test_network_and_allowlist_workflow.py
+new file mode 100644
+index 0000000..ec840c6
+--- /dev/null
++++ b/tests/test_network_and_allowlist_workflow.py
+@@ -0,0 +1,197 @@
++"""Tests for:
++- Feature 6: the read-only, GET-only, domain-allowlisted network fetch tool.
++- Feature 4: the curated app/folder allowlist workflow reachable via chat,
++  which must always require confirmation and re-uses the existing denylist.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++from assistant.core import LocalAssistant
++from assistant.network_tools import (
++    NetworkToolError,
++    add_allowed_domain,
++    load_network_allowlist,
++    validate_fetch_url,
++)
++
++
++class NetworkToolsTests(unittest.TestCase):
++    def test_fetch_blocked_with_empty_allowlist(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            with self.assertRaises(NetworkToolError):
++                validate_fetch_url("https://example.com", path)
++
++    def test_fetch_blocked_for_non_allowlisted_domain(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("example.com", path)
++            with self.assertRaises(NetworkToolError):
++                validate_fetch_url("https://evil.com", path)
++
++    def test_fetch_allowed_for_allowlisted_domain(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("example.com", path)
++            clean_url = validate_fetch_url("https://example.com/page", path)
++            self.assertEqual(clean_url, "https://example.com/page")
++
++    def test_fetch_rejects_non_http_scheme(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("example.com", path)
++            with self.assertRaises(NetworkToolError):
++                validate_fetch_url("ftp://example.com/file", path)
++
++    def test_add_allowed_domain_persists_and_normalizes(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("WWW.Example.com", path)
++            self.assertEqual(load_network_allowlist(path), ["example.com"])
++
++
++class NetworkFetchCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> LocalAssistant:
++        root = Path(temp_dir)
++        return LocalAssistant(
++            use_llm=False,
++            network_allowlist_path=root / "network_allowlist.json",
++            data_export_dir=root / "exports",
++        )
++
++    def test_fetch_command_requires_allowlisted_domain_first(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("fetch https://example.com")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("No domains are allowlisted", response.text)
++
++    def test_allow_network_domain_command_slices_correctly(self) -> None:
++        """Regression test for an off-by-one slicing bug: 'allow network
++        domain example.com' must add exactly 'example.com', not a mangled
++        variant like 'xample.com' with the first character dropped.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("allow network domain example.com")
++            self.assertIn("Added 'example.com'", response.text)
++            self.assertNotIn("Added 'xample.com'", response.text)
++            from assistant.network_tools import load_network_allowlist
++
++            self.assertEqual(load_network_allowlist(assistant.network_allowlist_path), ["example.com"])
++
++    def test_fetch_end_to_end_with_confirmation(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            assistant.respond("allow network domain example.com")
++
++            response = assistant.respond("fetch https://example.com/page")
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "network_fetch")
++
++            mock_response = MagicMock()
++            mock_response.status = 200
++            mock_response.headers = {"Content-Type": "text/html"}
++            mock_response.read.return_value = b"hello world"
++            mock_response.__enter__ = lambda self: mock_response
++            mock_response.__exit__ = lambda self, *a: None
++
++            with patch("assistant.network_tools.urllib.request.urlopen", return_value=mock_response):
++                result = assistant.confirm_pending_action(response.pending_action)
++            self.assertIn("Status: 200", result)
++            self.assertIn("hello world", result)
++
++    def test_network_fetch_never_uses_a_write_http_method(self) -> None:
++        """Static check: the fetch tool must remain GET-only end to end."""
++        import inspect
++        from assistant import network_tools
++
++        source = inspect.getsource(network_tools)
++        self.assertIn('method="GET"', source)
++        for method in ("POST", "PUT", "DELETE", "PATCH"):
++            self.assertNotIn(f'method="{method}"', source)
++
++
++class CuratedAllowlistWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> LocalAssistant:
++        root = Path(temp_dir)
++        return LocalAssistant(
++            use_llm=False,
++            apps_path=root / "apps.json",
++            folders_path=root / "folders.json",
++            data_export_dir=root / "exports",
++        )
++
++    def test_add_app_requires_confirmation(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("add app steam at notepad.exe")
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "add_allowed_app")
++            self.assertIn("Please confirm", response.text)
++
++    def test_add_app_end_to_end_persists(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("add app steam at notepad.exe")
++            result = assistant.confirm_pending_action(response.pending_action)
++            self.assertIn("Done: Added 'steam'", result)
++
++            from assistant.actions import load_allowed_apps
++
++            apps = load_allowed_apps(assistant.apps_path)
++            self.assertEqual(apps["steam"], "notepad.exe")
++
++    def test_add_app_rejects_denylisted_executable_even_under_friendly_name(self) -> None:
++        """Regression test: the curated-allowlist workflow must not become
++        a backdoor around the denylist -- 'add app sneaky at cmd.exe' must
++        be blocked, both at confirmation time and at execution time.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++
++            response = assistant.respond("add app sneaky at cmd.exe")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Action error", response.text)
++
++    def test_add_folder_requires_confirmation_and_persists(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root = Path(temp_dir)
++            target = root / "projects"
++            target.mkdir()
++            assistant = self._make_assistant(temp_dir)
++
++            response = assistant.respond(f"add folder projects at {target}")
++            self.assertIsNotNone(response.pending_action)
++            assert response.pending_action is not None
++            self.assertEqual(response.pending_action.kind, "add_allowed_folder")
++
++            result = assistant.confirm_pending_action(response.pending_action)
++            self.assertIn("Done: Added 'projects'", result)
++
++    def test_add_folder_rejects_nonexistent_path(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("add folder ghost at totally-nonexistent-xyz")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Action error", response.text)
++
++    def test_allowlisting_never_happens_without_explicit_confirmation(self) -> None:
++        """respond() alone (before 'yes') must never write to apps.json or
++        folders.json -- only confirm_pending_action() may.
++        """
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            assistant.respond("add app steam at notepad.exe")
++            self.assertFalse(assistant.apps_path.exists())
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_notification_workflow.py b/tests/test_notification_workflow.py
+new file mode 100644
+index 0000000..8790155
+--- /dev/null
++++ b/tests/test_notification_workflow.py
+@@ -0,0 +1,212 @@
++"""Tests for the deliberately narrow, pre-approved email notification.
++
++Key invariants under test:
++- Disabled by default; requires explicit config-file opt-in.
++- No conversational command can set/change recipient, subject, or SMTP host.
++- Password is never stored in the config file, only an env var name.
++- Sending always goes through PendingAction confirmation.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++from assistant.core import LocalAssistant
++from assistant.notifications import (
++    NotificationConfigError,
++    load_notification_config,
++    notification_config_summary,
++    send_configured_notification,
++)
++
++
++class NotificationConfigTests(unittest.TestCase):
++    def test_default_config_is_disabled(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            config = load_notification_config(Path(temp_dir) / "nope.json")
++            self.assertFalse(config.enabled)
++
++    def test_send_blocked_when_disabled(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "notification_config.json"
++            with self.assertRaises(NotificationConfigError):
++                send_configured_notification("body", path)
++
++    def test_send_blocked_when_config_incomplete(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "notification_config.json"
++            path.write_text(json.dumps({"enabled": True, "recipient": "me@example.com"}))
++            with self.assertRaises(NotificationConfigError) as ctx:
++                send_configured_notification("body", path)
++            self.assertIn("smtp_host", str(ctx.exception))
++
++    def test_send_blocked_when_password_env_var_missing(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "notification_config.json"
++            path.write_text(
++                json.dumps(
++                    {
++                        "enabled": True,
++                        "recipient": "me@example.com",
++                        "smtp_host": "smtp.example.com",
++                        "smtp_username": "bot@example.com",
++                        "smtp_password_env_var": "TOTALLY_UNSET_XYZ_VAR",
++                    }
++                )
++            )
++            os.environ.pop("TOTALLY_UNSET_XYZ_VAR", None)
++            with self.assertRaises(NotificationConfigError) as ctx:
++                send_configured_notification("body", path)
++            self.assertIn("TOTALLY_UNSET_XYZ_VAR", str(ctx.exception))
++
++    def test_config_summary_never_includes_password(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "notification_config.json"
++            path.write_text(
++                json.dumps(
++                    {
++                        "enabled": True,
++                        "recipient": "me@example.com",
++                        "smtp_host": "smtp.example.com",
++                        "smtp_username": "bot@example.com",
++                        "smtp_password_env_var": "SOME_VAR",
++                    }
++                )
++            )
++            os.environ["SOME_VAR"] = "super-secret-password"
++            try:
++                summary = notification_config_summary(path)
++            finally:
++                del os.environ["SOME_VAR"]
++            self.assertNotIn("super-secret-password", summary)
++
++    def test_send_succeeds_with_full_config_and_mocked_smtp(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "notification_config.json"
++            path.write_text(
++                json.dumps(
++                    {
++                        "enabled": True,
++                        "recipient": "me@example.com",
++                        "smtp_host": "smtp.example.com",
++                        "smtp_username": "bot@example.com",
++                        "smtp_password_env_var": "PW_VAR_XYZ",
++                    }
++                )
++            )
++            os.environ["PW_VAR_XYZ"] = "secret"
++            try:
++                mock_server = MagicMock()
++                mock_server.__enter__ = lambda self: mock_server
++                mock_server.__exit__ = lambda self, *a: None
++                with patch("assistant.notifications.smtplib.SMTP", return_value=mock_server):
++                    result = send_configured_notification("hello", path)
++                self.assertIn("me@example.com", result)
++                self.assertTrue(mock_server.send_message.called)
++                sent_message = mock_server.send_message.call_args[0][0]
++                self.assertEqual(str(sent_message["To"]), "me@example.com")
++            finally:
++                del os.environ["PW_VAR_XYZ"]
++
++    def test_send_never_allows_caller_to_override_recipient(self) -> None:
++        """The function signature itself must not accept a recipient
++        argument -- the only thing a caller can influence is the body and
++        an optional subject suffix.
++        """
++        import inspect
++
++        signature = inspect.signature(send_configured_notification)
++        self.assertNotIn("recipient", signature.parameters)
++        self.assertNotIn("to", signature.parameters)
++
++
++class NotificationCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> LocalAssistant:
++        root = Path(temp_dir)
++        return LocalAssistant(
++            use_llm=False,
++            notification_config_path=root / "notification_config.json",
++            data_export_dir=root / "exports",
++        )
++
++    def test_send_daily_summary_blocked_when_not_configured(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("send daily summary email")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("disabled", response.text.lower())
++
++    def test_no_conversational_command_can_set_recipient(self) -> None:
++        """There must be no NL command anywhere that sets/changes the
++        notification recipient -- config file editing is the only path.
++        """
++        core_source = Path("assistant/core.py").read_text(encoding="utf-8")
++        for forbidden_phrase in ("set notification recipient", "set email recipient", "configure notification"):
++            self.assertNotIn(forbidden_phrase, core_source)
++
++    def test_send_daily_summary_end_to_end_with_mocked_smtp(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            assistant.notification_config_path.parent.mkdir(parents=True, exist_ok=True)
++            assistant.notification_config_path.write_text(
++                json.dumps(
++                    {
++                        "enabled": True,
++                        "recipient": "me@example.com",
++                        "smtp_host": "smtp.example.com",
++                        "smtp_username": "bot@example.com",
++                        "smtp_password_env_var": "PW_VAR_ABC",
++                    }
++                )
++            )
++            os.environ["PW_VAR_ABC"] = "secret"
++            try:
++                assistant.tasks_store.add("Buy milk")
++
++                response = assistant.respond("send daily summary email")
++                self.assertIsNotNone(response.pending_action)
++                assert response.pending_action is not None
++                self.assertEqual(response.pending_action.kind, "send_notification")
++                self.assertIn("me@example.com", response.text)
++                self.assertIn("Buy milk", response.pending_action.target)
++
++                mock_server = MagicMock()
++                mock_server.__enter__ = lambda self: mock_server
++                mock_server.__exit__ = lambda self, *a: None
++                with patch("assistant.notifications.smtplib.SMTP", return_value=mock_server):
++                    result = assistant.confirm_pending_action(response.pending_action)
++                self.assertIn("Sent notification email to me@example.com", result)
++            finally:
++                del os.environ["PW_VAR_ABC"]
++
++    def test_send_does_not_happen_without_confirmation(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            assistant.notification_config_path.parent.mkdir(parents=True, exist_ok=True)
++            assistant.notification_config_path.write_text(
++                json.dumps(
++                    {
++                        "enabled": True,
++                        "recipient": "me@example.com",
++                        "smtp_host": "smtp.example.com",
++                        "smtp_username": "bot@example.com",
++                        "smtp_password_env_var": "PW_VAR_DEF",
++                    }
++                )
++            )
++            os.environ["PW_VAR_DEF"] = "secret"
++            try:
++                with patch("assistant.notifications.smtplib.SMTP") as mock_smtp:
++                    assistant.respond("send daily summary email")
++                    mock_smtp.assert_not_called()
++            finally:
++                del os.environ["PW_VAR_DEF"]
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_safety_boundaries.py b/tests/test_safety_boundaries.py
+index 7dfd12f..bb32d2d 100644
+--- a/tests/test_safety_boundaries.py
++++ b/tests/test_safety_boundaries.py
+@@ -137,12 +137,17 @@ class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
+             drafts = store.list_drafts()
+             self.assertEqual(len(drafts), 2)
+ 
+-    def test_no_outbound_network_calls_target_non_local_hosts(self) -> None:
+-        """Any real urllib.request.urlopen call anywhere in the package must
+-        target localhost/127.0.0.1 (the local Ollama server), never an
+-        arbitrary remote host.
++    def test_no_outbound_network_calls_target_non_local_hosts_outside_network_tools(self) -> None:
++        """Any real urllib.request.urlopen call OUTSIDE assistant/network_tools.py
++        must target localhost/127.0.0.1 (the local Ollama server), never an
++        arbitrary remote host. assistant/network_tools.py is intentionally
++        excluded: it is a deliberate, separately-gated capability (GET-only,
++        domain-allowlisted, confirmation-required) covered by its own tests
++        in test_network_tools.py, not an accidental/unaudited network call.
+         """
+         for path in ASSISTANT_DIR.glob("*.py"):
++            if path.name == "network_tools.py":
++                continue
+             source = path.read_text(encoding="utf-8")
+             if "urlopen(" not in source and "urllib.request.Request(" not in source:
+                 continue
+@@ -150,6 +155,24 @@ class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
+                 if "http://" in line and "127.0.0.1" not in line and "localhost" not in line:
+                     self.fail(f"{path.name} references a non-local http:// URL: {line.strip()}")
+ 
++    def test_network_tools_only_supports_get_requests(self) -> None:
++        """assistant/network_tools.py must remain read-only: no POST/PUT/
++        DELETE/PATCH support, so it can never be used to send data anywhere.
++        """
++        source = (ASSISTANT_DIR / "network_tools.py").read_text(encoding="utf-8")
++        self.assertIn('method="GET"', source)
++        for forbidden_method in ('method="POST"', 'method="PUT"', 'method="DELETE"', 'method="PATCH"'):
++            self.assertNotIn(forbidden_method, source)
++
++    def test_network_tools_refuses_fetch_with_empty_allowlist(self) -> None:
++        import tempfile
++        from assistant.network_tools import NetworkToolError, validate_fetch_url
++
++        with tempfile.TemporaryDirectory() as tmp:
++            allowlist_path = Path(tmp) / "network_allowlist.json"
++            with self.assertRaises(NetworkToolError):
++                validate_fetch_url("https://example.com", allowlist_path)
++
+ 
+ class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
+     def test_check_ollama_on_startup_defaults_to_false(self) -> None:
+@@ -170,13 +193,29 @@ class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
+         self.assertNotIn("windows_integration", cli_source)
+         self.assertNotIn("windows_integration", core_source)
+ 
+-    def test_add_allowed_app_and_folder_only_reachable_via_explicit_gui_action(self) -> None:
++    def test_add_allowed_app_and_folder_only_reachable_after_explicit_confirmation(self) -> None:
+         """Allowlisting a new app/folder must never happen automatically from
+-        conversational input -- only through an explicit, separate call.
++        conversational input alone -- it must always go through the same
++        PendingAction confirm_pending_action() gate as every other
++        state-changing action (the user must type the request AND then
++        separately confirm with 'yes'). It is fine for this to be reachable
++        via chat (e.g. "add app X at Y") as long as it's confirmation-gated;
++        it must never be callable directly from respond()'s parsing path.
+         """
+         core_source = (ASSISTANT_DIR / "core.py").read_text(encoding="utf-8")
+-        self.assertNotIn("add_allowed_app(", core_source)
+-        self.assertNotIn("add_allowed_folder(", core_source)
++        respond_start = core_source.index("\n    def respond(")
++        confirm_start = core_source.index("\n    def confirm_pending_action(")
++        # confirm_pending_action must come after respond() in the file, and
++        # both add_allowed_app(/add_allowed_folder( calls must live at or
++        # after confirm_pending_action's definition -- never inside respond().
++        self.assertGreater(confirm_start, respond_start)
++        respond_body = core_source[respond_start:confirm_start]
++        self.assertNotIn("add_allowed_app(", respond_body)
++        self.assertNotIn("add_allowed_folder(", respond_body)
++
++        rest_of_file = core_source[confirm_start:]
++        self.assertIn("add_allowed_app(", rest_of_file)
++        self.assertIn("add_allowed_folder(", rest_of_file)
+ 
+ 
+ if __name__ == "__main__":
