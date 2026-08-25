@@ -9,3 +9,5 @@ __pycache__/
 models/
 data/
 exports/
+config/notification_config.json
+config/network_allowlist.json

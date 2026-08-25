@@ -16,6 +16,8 @@ from assistant.actions import (
     describe_allowed_actions,
     execute_action,
     parse_action,
+    remove_allowed_app,
+    remove_allowed_folder,
     validate_app_target,
     validate_folder_target,
 )
@@ -71,6 +73,7 @@ from assistant.network_tools import (
     fetch_url,
     network_allowlist_summary,
     normalize_domain,
+    remove_allowed_domain,
     validate_fetch_url,
 )
 from assistant.notes import NotesError, NotesStore
@@ -537,14 +540,23 @@ class LocalAssistant:
         if normalized.startswith("allow network domain "):
             return AssistantResponse(self._allow_network_domain_text(user_text.strip()[len("allow network domain "):]))
 
+        if normalized.startswith("remove network domain "):
+            return AssistantResponse(self._remove_network_domain_text(user_text.strip()[len("remove network domain "):]))
+
         if normalized.startswith("fetch "):
             return self._fetch_url_confirmation(user_text.strip()[len("fetch "):])
 
         if normalized.startswith("add app "):
             return self._add_allowed_app_confirmation(user_text.strip()[len("add app "):])
 
+        if normalized.startswith("remove app "):
+            return AssistantResponse(self._remove_allowed_app_text(user_text.strip()[len("remove app "):]))
+
         if normalized.startswith("add folder "):
             return self._add_allowed_folder_confirmation(user_text.strip()[len("add folder "):])
+
+        if normalized.startswith("remove folder "):
+            return AssistantResponse(self._remove_allowed_folder_text(user_text.strip()[len("remove folder "):]))
 
         if normalized.startswith("backup folder "):
             return self._backup_folder_confirmation(user_text.strip()[len("backup folder "):])
@@ -1318,6 +1330,14 @@ class LocalAssistant:
             return f"Network tool error: {exc}"
         return f"Added '{normalize_domain(domain_text)}' to the network fetch allowlist. Allowed domains: {', '.join(domains)}"
 
+    def _remove_network_domain_text(self, domain_text: str) -> str:
+        try:
+            domains = remove_allowed_domain(domain_text, self.network_allowlist_path)
+        except NetworkToolError as exc:
+            return f"Network tool error: {exc}"
+        remaining = ", ".join(domains) if domains else "(none)"
+        return f"Removed '{normalize_domain(domain_text)}' from the network fetch allowlist. Allowed domains: {remaining}"
+
     def _fetch_url_confirmation(self, url_text: str) -> AssistantResponse:
         try:
             clean_url = validate_fetch_url(url_text, self.network_allowlist_path)
@@ -1507,6 +1527,14 @@ class LocalAssistant:
             pending_action=action,
         )
 
+    def _remove_allowed_app_text(self, name: str) -> str:
+        try:
+            apps = remove_allowed_app(name.strip(), self.apps_path)
+        except ActionError as exc:
+            return f"Action error: {exc}"
+        remaining = ", ".join(sorted(apps)) if apps else "(none)"
+        return f"Removed '{name.strip()}' from the allowed apps list. Remaining: {remaining}"
+
     def _add_allowed_folder_confirmation(self, text: str) -> AssistantResponse:
         name, separator, target = text.partition(" at ")
         if not separator or not name.strip() or not target.strip():
@@ -1528,6 +1556,14 @@ class LocalAssistant:
             f"Please confirm: {action.description}. Type 'yes' to continue.",
             pending_action=action,
         )
+
+    def _remove_allowed_folder_text(self, name: str) -> str:
+        try:
+            folders = remove_allowed_folder(name.strip(), self.folders_path)
+        except ActionError as exc:
+            return f"Action error: {exc}"
+        remaining = ", ".join(sorted(folders)) if folders else "(none)"
+        return f"Removed '{name.strip()}' from the allowed folders list. Remaining: {remaining}"
 
     def _shell_commands_text(self) -> str:
         try:

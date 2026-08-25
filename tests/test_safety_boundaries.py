@@ -173,6 +173,17 @@ class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
             with self.assertRaises(NetworkToolError):
                 validate_fetch_url("https://example.com", allowlist_path)
 
+    def test_personal_config_files_are_gitignored(self) -> None:
+        """config/notification_config.json (once configured, contains a
+        real recipient email and SMTP username) and
+        config/network_allowlist.json (a personal domain list) must never
+        be accidentally committed via a broad 'git add -A'.
+        """
+        gitignore_path = Path(__file__).resolve().parent.parent / ".gitignore"
+        gitignore = gitignore_path.read_text(encoding="utf-8")
+        self.assertIn("config/notification_config.json", gitignore)
+        self.assertIn("config/network_allowlist.json", gitignore)
+
 
 class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
     def test_check_ollama_on_startup_defaults_to_false(self) -> None:

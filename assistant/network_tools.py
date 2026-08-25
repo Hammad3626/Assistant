@@ -98,6 +98,17 @@ def add_allowed_domain(domain: str, path: str | Path = DEFAULT_NETWORK_ALLOWLIST
     return domains
 
 
+def remove_allowed_domain(domain: str, path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> list[str]:
+    clean_domain = normalize_domain(domain)
+    domains = load_network_allowlist(path)
+    if clean_domain not in domains:
+        available = ", ".join(domains) or "(none configured)"
+        raise NetworkToolError(f"'{clean_domain}' is not on the network allowlist. Allowed: {available}")
+    domains.remove(clean_domain)
+    save_network_allowlist(domains, path)
+    return domains
+
+
 def validate_fetch_url(url: str, allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> str:
     """Validate a URL is https/http, well-formed, and on the domain allowlist.
 

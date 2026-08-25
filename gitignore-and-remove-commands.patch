@@ -1,0 +1,343 @@
+diff --git a/.gitignore b/.gitignore
+index 12ccf3d..853bb00 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,5 @@ __pycache__/
+ models/
+ data/
+ exports/
++config/notification_config.json
++config/network_allowlist.json
+diff --git a/assistant/actions.py b/assistant/actions.py
+index c0191ff..3cdc796 100644
+--- a/assistant/actions.py
++++ b/assistant/actions.py
+@@ -221,6 +221,28 @@ def add_allowed_folder(
+     return valid_existing
+ 
+ 
++def remove_allowed_app(name: str, path: str | Path = DEFAULT_APPS_PATH) -> dict[str, str]:
++    apps = load_allowed_apps(path)
++    clean_name = normalize_action_text(name)
++    if clean_name not in apps:
++        available = ", ".join(sorted(apps)) or "(none configured)"
++        raise ActionError(f"'{name}' is not in the allowed apps list. Available: {available}")
++    del apps[clean_name]
++    save_allowed_apps(apps, path)
++    return apps
++
++
++def remove_allowed_folder(name: str, path: str | Path = DEFAULT_FOLDERS_PATH) -> dict[str, str]:
++    folders = load_allowed_folders(path)
++    clean_name = normalize_action_text(name)
++    if clean_name not in folders:
++        available = ", ".join(sorted(folders)) or "(none configured)"
++        raise ActionError(f"'{name}' is not in the allowed folders list. Available: {available}")
++    del folders[clean_name]
++    save_allowed_folders(folders, path)
++    return folders
++
++
+ def validate_app_target(target: str) -> None:
+     clean_target = target.strip()
+     if not clean_target:
+diff --git a/assistant/core.py b/assistant/core.py
+index 667e7f8..af0b941 100644
+--- a/assistant/core.py
++++ b/assistant/core.py
+@@ -16,6 +16,8 @@ from assistant.actions import (
+     describe_allowed_actions,
+     execute_action,
+     parse_action,
++    remove_allowed_app,
++    remove_allowed_folder,
+     validate_app_target,
+     validate_folder_target,
+ )
+@@ -71,6 +73,7 @@ from assistant.network_tools import (
+     fetch_url,
+     network_allowlist_summary,
+     normalize_domain,
++    remove_allowed_domain,
+     validate_fetch_url,
+ )
+ from assistant.notes import NotesError, NotesStore
+@@ -537,15 +540,24 @@ class LocalAssistant:
+         if normalized.startswith("allow network domain "):
+             return AssistantResponse(self._allow_network_domain_text(user_text.strip()[len("allow network domain "):]))
+ 
++        if normalized.startswith("remove network domain "):
++            return AssistantResponse(self._remove_network_domain_text(user_text.strip()[len("remove network domain "):]))
++
+         if normalized.startswith("fetch "):
+             return self._fetch_url_confirmation(user_text.strip()[len("fetch "):])
+ 
+         if normalized.startswith("add app "):
+             return self._add_allowed_app_confirmation(user_text.strip()[len("add app "):])
+ 
++        if normalized.startswith("remove app "):
++            return AssistantResponse(self._remove_allowed_app_text(user_text.strip()[len("remove app "):]))
++
+         if normalized.startswith("add folder "):
+             return self._add_allowed_folder_confirmation(user_text.strip()[len("add folder "):])
+ 
++        if normalized.startswith("remove folder "):
++            return AssistantResponse(self._remove_allowed_folder_text(user_text.strip()[len("remove folder "):]))
++
+         if normalized.startswith("backup folder "):
+             return self._backup_folder_confirmation(user_text.strip()[len("backup folder "):])
+ 
+@@ -1318,6 +1330,14 @@ class LocalAssistant:
+             return f"Network tool error: {exc}"
+         return f"Added '{normalize_domain(domain_text)}' to the network fetch allowlist. Allowed domains: {', '.join(domains)}"
+ 
++    def _remove_network_domain_text(self, domain_text: str) -> str:
++        try:
++            domains = remove_allowed_domain(domain_text, self.network_allowlist_path)
++        except NetworkToolError as exc:
++            return f"Network tool error: {exc}"
++        remaining = ", ".join(domains) if domains else "(none)"
++        return f"Removed '{normalize_domain(domain_text)}' from the network fetch allowlist. Allowed domains: {remaining}"
++
+     def _fetch_url_confirmation(self, url_text: str) -> AssistantResponse:
+         try:
+             clean_url = validate_fetch_url(url_text, self.network_allowlist_path)
+@@ -1507,6 +1527,14 @@ class LocalAssistant:
+             pending_action=action,
+         )
+ 
++    def _remove_allowed_app_text(self, name: str) -> str:
++        try:
++            apps = remove_allowed_app(name.strip(), self.apps_path)
++        except ActionError as exc:
++            return f"Action error: {exc}"
++        remaining = ", ".join(sorted(apps)) if apps else "(none)"
++        return f"Removed '{name.strip()}' from the allowed apps list. Remaining: {remaining}"
++
+     def _add_allowed_folder_confirmation(self, text: str) -> AssistantResponse:
+         name, separator, target = text.partition(" at ")
+         if not separator or not name.strip() or not target.strip():
+@@ -1529,6 +1557,14 @@ class LocalAssistant:
+             pending_action=action,
+         )
+ 
++    def _remove_allowed_folder_text(self, name: str) -> str:
++        try:
++            folders = remove_allowed_folder(name.strip(), self.folders_path)
++        except ActionError as exc:
++            return f"Action error: {exc}"
++        remaining = ", ".join(sorted(folders)) if folders else "(none)"
++        return f"Removed '{name.strip()}' from the allowed folders list. Remaining: {remaining}"
++
+     def _shell_commands_text(self) -> str:
+         try:
+             return shell_commands_summary(self.shell_commands_path)
+diff --git a/assistant/network_tools.py b/assistant/network_tools.py
+index 0d3d48d..c0047af 100644
+--- a/assistant/network_tools.py
++++ b/assistant/network_tools.py
+@@ -98,6 +98,17 @@ def add_allowed_domain(domain: str, path: str | Path = DEFAULT_NETWORK_ALLOWLIST
+     return domains
+ 
+ 
++def remove_allowed_domain(domain: str, path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> list[str]:
++    clean_domain = normalize_domain(domain)
++    domains = load_network_allowlist(path)
++    if clean_domain not in domains:
++        available = ", ".join(domains) or "(none configured)"
++        raise NetworkToolError(f"'{clean_domain}' is not on the network allowlist. Allowed: {available}")
++    domains.remove(clean_domain)
++    save_network_allowlist(domains, path)
++    return domains
++
++
+ def validate_fetch_url(url: str, allowlist_path: str | Path = DEFAULT_NETWORK_ALLOWLIST_PATH) -> str:
+     """Validate a URL is https/http, well-formed, and on the domain allowlist.
+ 
+diff --git a/tests/test_remove_allowlist_commands.py b/tests/test_remove_allowlist_commands.py
+new file mode 100644
+index 0000000..9cde572
+--- /dev/null
++++ b/tests/test_remove_allowlist_commands.py
+@@ -0,0 +1,159 @@
++"""Tests for the revocation commands that complete the curated allowlist
++workflows built earlier: 'remove app', 'remove folder', 'remove network
++domain'. Unlike granting access (add/allow), revoking is the safe
++direction, so these are immediate -- no confirmation required.
++"""
++
++from __future__ import annotations
++
++import tempfile
++import unittest
++from pathlib import Path
++
++from assistant.actions import (
++    ActionError,
++    load_allowed_apps,
++    load_allowed_folders,
++    remove_allowed_app,
++    remove_allowed_folder,
++    save_allowed_apps,
++    save_allowed_folders,
++)
++from assistant.core import LocalAssistant
++from assistant.network_tools import (
++    NetworkToolError,
++    add_allowed_domain,
++    load_network_allowlist,
++    remove_allowed_domain,
++)
++
++
++class RemoveAllowedAppUnitTests(unittest.TestCase):
++    def test_remove_existing_app(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "apps.json"
++            save_allowed_apps({"steam": "steam.exe", "notepad": "notepad.exe"}, path)
++
++            apps = remove_allowed_app("steam", path)
++
++            self.assertNotIn("steam", apps)
++            self.assertIn("notepad", apps)
++            self.assertNotIn("steam", load_allowed_apps(path))
++
++    def test_remove_nonexistent_app_raises_with_available_list(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "apps.json"
++            save_allowed_apps({"notepad": "notepad.exe"}, path)
++
++            with self.assertRaises(ActionError) as ctx:
++                remove_allowed_app("ghost", path)
++            self.assertIn("notepad", str(ctx.exception))
++
++
++class RemoveAllowedFolderUnitTests(unittest.TestCase):
++    def test_remove_existing_folder(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            workspace = Path(temp_dir) / "workspace"
++            workspace.mkdir()
++            path = Path(temp_dir) / "folders.json"
++            save_allowed_folders({"workspace": str(workspace)}, path)
++
++            folders = remove_allowed_folder("workspace", path)
++
++            self.assertNotIn("workspace", folders)
++            self.assertNotIn("workspace", load_allowed_folders(path))
++
++    def test_remove_nonexistent_folder_raises(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "folders.json"
++            save_allowed_folders({}, path)
++
++            with self.assertRaises(ActionError):
++                remove_allowed_folder("ghost", path)
++
++
++class RemoveAllowedDomainUnitTests(unittest.TestCase):
++    def test_remove_existing_domain(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("example.com", path)
++
++            domains = remove_allowed_domain("example.com", path)
++
++            self.assertEqual(domains, [])
++            self.assertEqual(load_network_allowlist(path), [])
++
++    def test_remove_nonexistent_domain_raises(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            with self.assertRaises(NetworkToolError):
++                remove_allowed_domain("example.com", path)
++
++    def test_remove_normalizes_domain_the_same_as_add(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / "network_allowlist.json"
++            add_allowed_domain("WWW.Example.com", path)
++
++            domains = remove_allowed_domain("example.com", path)
++            self.assertEqual(domains, [])
++
++
++class RemoveCommandsCoreWorkflowTests(unittest.TestCase):
++    def _make_assistant(self, temp_dir: str) -> LocalAssistant:
++        root = Path(temp_dir)
++        return LocalAssistant(
++            use_llm=False,
++            apps_path=root / "apps.json",
++            folders_path=root / "folders.json",
++            network_allowlist_path=root / "network_allowlist.json",
++            data_export_dir=root / "exports",
++        )
++
++    def test_remove_app_no_confirmation_needed(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            add_response = assistant.respond("add app steam at notepad.exe")
++            assistant.confirm_pending_action(add_response.pending_action)
++
++            response = assistant.respond("remove app steam")
++
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Removed 'steam'", response.text)
++
++    def test_remove_folder_no_confirmation_needed(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            root = Path(temp_dir)
++            target = root / "projects"
++            target.mkdir()
++            assistant = self._make_assistant(temp_dir)
++            add_response = assistant.respond(f"add folder projects at {target}")
++            assistant.confirm_pending_action(add_response.pending_action)
++
++            response = assistant.respond("remove folder projects")
++
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Removed 'projects'", response.text)
++
++    def test_remove_network_domain_no_confirmation_needed(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            assistant.respond("allow network domain example.com")
++
++            response = assistant.respond("remove network domain example.com")
++
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Removed 'example.com'", response.text)
++
++            fetch_response = assistant.respond("fetch https://example.com")
++            self.assertIsNone(fetch_response.pending_action)
++
++    def test_remove_app_command_does_not_collide_with_add_app(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            assistant = self._make_assistant(temp_dir)
++            response = assistant.respond("remove app steam")
++            self.assertIsNone(response.pending_action)
++            self.assertIn("Action error", response.text)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_safety_boundaries.py b/tests/test_safety_boundaries.py
+index bb32d2d..e3c098b 100644
+--- a/tests/test_safety_boundaries.py
++++ b/tests/test_safety_boundaries.py
+@@ -173,6 +173,17 @@ class NoRealSendOrNetworkCapabilityTests(unittest.TestCase):
+             with self.assertRaises(NetworkToolError):
+                 validate_fetch_url("https://example.com", allowlist_path)
+ 
++    def test_personal_config_files_are_gitignored(self) -> None:
++        """config/notification_config.json (once configured, contains a
++        real recipient email and SMTP username) and
++        config/network_allowlist.json (a personal domain list) must never
++        be accidentally committed via a broad 'git add -A'.
++        """
++        gitignore_path = Path(__file__).resolve().parent.parent / ".gitignore"
++        gitignore = gitignore_path.read_text(encoding="utf-8")
++        self.assertIn("config/notification_config.json", gitignore)
++        self.assertIn("config/network_allowlist.json", gitignore)
++
+ 
+ class NoUnconfirmedAutoLaunchTests(unittest.TestCase):
+     def test_check_ollama_on_startup_defaults_to_false(self) -> None:

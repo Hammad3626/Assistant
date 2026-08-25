@@ -221,6 +221,28 @@ def add_allowed_folder(
     return valid_existing
 
 
+def remove_allowed_app(name: str, path: str | Path = DEFAULT_APPS_PATH) -> dict[str, str]:
+    apps = load_allowed_apps(path)
+    clean_name = normalize_action_text(name)
+    if clean_name not in apps:
+        available = ", ".join(sorted(apps)) or "(none configured)"
+        raise ActionError(f"'{name}' is not in the allowed apps list. Available: {available}")
+    del apps[clean_name]
+    save_allowed_apps(apps, path)
+    return apps
+
+
+def remove_allowed_folder(name: str, path: str | Path = DEFAULT_FOLDERS_PATH) -> dict[str, str]:
+    folders = load_allowed_folders(path)
+    clean_name = normalize_action_text(name)
+    if clean_name not in folders:
+        available = ", ".join(sorted(folders)) or "(none configured)"
+        raise ActionError(f"'{name}' is not in the allowed folders list. Available: {available}")
+    del folders[clean_name]
+    save_allowed_folders(folders, path)
+    return folders
+
+
 def validate_app_target(target: str) -> None:
     clean_target = target.strip()
     if not clean_target:
