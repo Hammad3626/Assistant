@@ -18,7 +18,7 @@ import time
 
 from assistant.ollama_client import OllamaClient
 from assistant.voice_input import listen_once, VoiceInputConfig, VoiceInputError
-from assistant.file_tools import AllowlistedFileTools
+from assistant.file_tools import AllowlistedFileTools, FileToolError
 from assistant.shell_tools import run_shell_command, add_shell_command, ShellToolError
 from assistant.memory import MemoryStore
 
@@ -111,63 +111,67 @@ class FileToolsResilienceTests(unittest.TestCase):
         self.temp_dir.cleanup()
     
     def test_file_read_permission_denied(self):
-        """Reading file without permission should skip, not crash."""
+        """Reading a file without permission should raise a clean
+        FileToolError, not an uncaught PermissionError.
+        """
         test_file = self.temp_path / "restricted.txt"
         test_file.write_text("content")
-        
-        with patch('builtins.open', side_effect=PermissionError("Access denied")):
-            file_tools = AllowlistedFileTools(str(self.config_file))
-            
-            # Should handle gracefully
-            try:
-                result = file_tools.preview_file("test", "restricted.txt", max_lines=10)
-                # Should return error message, not crash
-                self.assertIsNotNone(result)
-            except PermissionError:
-                self.fail("Should catch PermissionError, not re-raise")
-    
+
+        file_tools = AllowlistedFileTools(str(self.config_file))
+        with patch.object(Path, "read_text", side_effect=PermissionError("Access denied")):
+            with self.assertRaises(FileToolError):
+                file_tools.read_file_summary("test", "restricted.txt")
+
     def test_file_write_disk_full_recovery(self):
-        """Disk full during write should warn, not corrupt file."""
-        test_file = self.temp_path / "test.txt"
-        original_content = "original"
-        test_file.write_text(original_content)
-        
-        with patch('builtins.open', side_effect=OSError("No space left on device")):
-            file_tools = AllowlistedFileTools(str(self.config_file))
-            
-            # Should not corrupt original file
-            # (Requires atomic write implementation)
-            try:
-                file_tools.edit_file_text("test", "test.txt", "new content", 
-                                         replace_all=True)
-            except OSError:
-                pass
-            
-            # Original file should be unchanged if write failed
-            actual = test_file.read_text()
-            self.assertEqual(actual, original_content)
-    
+        """Disk full partway through a multi-file bulk commit must not
+        leave the folder partially changed -- files already written in
+        this attempt must be automatically restored to their original
+        content before the error is raised.
+        """
+        file_a = self.temp_path / "a.txt"
+        file_b = self.temp_path / "b.txt"
+        file_a.write_text("hello one")
+        file_b.write_text("hello two")
+
+        file_tools = AllowlistedFileTools(str(self.config_file))
+        file_tools.backup_bulk_replace_plan("test", "hello", "goodbye")
+        phrase = file_tools.bulk_replace_required_confirmation_phrase("test", "hello", "goodbye")
+
+        original_write_text = Path.write_text
+        call_count = {"n": 0}
+
+        def flaky_write_text(self, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise OSError("No space left on device")
+            return original_write_text(self, *args, **kwargs)
+
+        with patch.object(Path, "write_text", flaky_write_text):
+            with self.assertRaises(FileToolError):
+                file_tools.commit_bulk_replace_plan("test", "hello", "goodbye", phrase)
+
+        # Whichever file was written before the simulated disk-full error
+        # must have been automatically restored -- nothing left half-applied.
+        self.assertEqual(file_a.read_text(), "hello one")
+        self.assertEqual(file_b.read_text(), "hello two")
+
     def test_bulk_operation_partial_failure_recovery(self):
-        """Bulk operation failure on one file should not stop entire batch."""
-        # Create multiple test files
+        """Scanning a bulk replace plan should skip files it can't read
+        rather than crashing the whole batch.
+        """
         (self.temp_path / "file1.txt").write_text("content1")
         (self.temp_path / "file2.txt").write_text("content2")
         (self.temp_path / "file3.txt").write_text("content3")
-        
+
         file_tools = AllowlistedFileTools(str(self.config_file))
-        
-        # Plan should succeed even if some files can't be modified
-        result = file_tools.bulk_text_replace_plan(
-            "test",
-            search_term="content",
-            replace_term="replaced",
-            file_extensions=[".txt"],
-            limit=10
-        )
-        
-        # Result should show which operations would succeed/fail
+
+        result = file_tools.bulk_replace_plan_summary("test", "content", "replaced", limit=10)
+
         self.assertIsNotNone(result)
-    
+        self.assertIn("file1.txt", result)
+        self.assertIn("file2.txt", result)
+        self.assertIn("file3.txt", result)
+
     def test_corrupted_trash_manifest_recovery(self):
         """Corrupted trash manifest should not prevent file operations."""
         file_tools = AllowlistedFileTools(str(self.config_file))

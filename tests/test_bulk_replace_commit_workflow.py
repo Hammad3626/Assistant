@@ -108,6 +108,68 @@ class BulkReplaceCommitUnitTests(unittest.TestCase):
                 (source / "a.txt").read_text(encoding="utf-8"), "hello world -- edited externally!"
             )
 
+    def test_commit_auto_restores_already_changed_files_on_partial_failure(self) -> None:
+        """Regression test: if a multi-file commit fails partway through
+        (e.g. disk full on the 2nd of 3 files), files already changed in
+        this attempt must be automatically restored to their original
+        content -- the folder must never be left partially applied with no
+        way for rollback_bulk_replace_commit() to help (it only works once
+        apply_enabled is set, which only happens after a FULL success).
+        """
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "docs"
+            source.mkdir()
+            file_a = source / "a.txt"
+            file_b = source / "b.txt"
+            file_c = source / "c.txt"
+            file_a.write_text("hello one", encoding="utf-8")
+            file_b.write_text("hello two", encoding="utf-8")
+            file_c.write_text("hello three", encoding="utf-8")
+            folders_path = root / "folders.json"
+            save_allowed_folders({"docs": str(source)}, folders_path)
+            tools = AllowlistedFileTools(
+                folders_path=folders_path,
+                trash_dir=root / "trash",
+                manifest_path=root / "trash-manifest.json",
+                bulk_backup_dir=root / "bulk-backups",
+                bulk_approval_dir=root / "bulk-approvals",
+                bulk_review_dir=root / "bulk-reviews",
+                bulk_rollback_dir=root / "bulk-rollbacks",
+                bulk_preflight_dir=root / "bulk-preflights",
+                bulk_checklist_dir=root / "bulk-checklists",
+            )
+            tools.backup_bulk_replace_plan("docs", "hello", "goodbye")
+            phrase = tools.bulk_replace_required_confirmation_phrase("docs", "hello", "goodbye")
+
+            original_write_text = Path.write_text
+            call_count = {"n": 0}
+
+            def flaky_write_text(self, *args, **kwargs):
+                call_count["n"] += 1
+                if call_count["n"] == 2:
+                    raise OSError("No space left on device")
+                return original_write_text(self, *args, **kwargs)
+
+            with patch.object(Path, "write_text", flaky_write_text):
+                with self.assertRaises(FileToolError) as ctx:
+                    tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
+            self.assertIn("automatically restored", str(ctx.exception))
+
+            # File 1 (already written when failure hit) must be restored;
+            # files 2 and 3 must be exactly as they started.
+            self.assertEqual(file_a.read_text(encoding="utf-8"), "hello one")
+            self.assertEqual(file_b.read_text(encoding="utf-8"), "hello two")
+            self.assertEqual(file_c.read_text(encoding="utf-8"), "hello three")
+
+            # Since nothing was left partially applied, apply_enabled must
+            # still be false -- and a fresh commit attempt (without the
+            # flaky patch) must succeed cleanly afterward.
+            result = tools.commit_bulk_replace_plan("docs", "hello", "goodbye", phrase)
+            self.assertIn("Applied bulk replace to 3 file(s)", result)
+
     def test_rollback_restores_original_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             tools, source = self._tools(temp_dir)

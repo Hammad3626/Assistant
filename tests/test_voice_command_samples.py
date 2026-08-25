@@ -27,12 +27,22 @@ class VoiceCommandSampleTests(unittest.TestCase):
                 self.assertEqual(action.kind, "app")
 
     def test_sample_folder_and_settings_commands(self) -> None:
-        command = self._pipeline_command("show my downloads folder")
-        action = parse_action(command)
-        self.assertEqual(command, "open downloads")
-        self.assertIsNotNone(action)
-        assert action is not None
-        self.assertEqual(action.kind, "folder")
+        import tempfile
+        from pathlib import Path
+        from assistant.actions import save_allowed_folders
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "Downloads"
+            downloads_dir.mkdir()
+            folders_path = Path(temp_dir) / "folders.json"
+            save_allowed_folders({"downloads": str(downloads_dir)}, folders_path)
+
+            command = self._pipeline_command("show my downloads folder")
+            action = parse_action(command, folders_path=folders_path)
+            self.assertEqual(command, "open downloads")
+            self.assertIsNotNone(action)
+            assert action is not None
+            self.assertEqual(action.kind, "folder")
 
         settings_command = self._pipeline_command("open windows settings")
         settings_action = parse_action(settings_command)

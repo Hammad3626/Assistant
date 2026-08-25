@@ -969,6 +969,42 @@ class LocalAssistant:
         self.history_store.append("assistant", assistant_text)
 
     def confirm_pending_action(self, action: PendingAction) -> str:
+        """Execute a confirmed pending action and record it in the action
+        audit log, regardless of which kind of action it is.
+
+        This is a thin wrapper around _execute_pending_action so every
+        confirmed action -- not just the two script-simulation kinds that
+        used to call action_audit_store.record() directly -- leaves an
+        audit trail. Exceptions are recorded too (as status="error") before
+        being re-raised, so even an unexpected bug still leaves a record of
+        what was attempted.
+        """
+        try:
+            result = self._execute_pending_action(action)
+        except Exception as exc:
+            try:
+                self.action_audit_store.record(
+                    action,
+                    status="error",
+                    requested_by="confirm_pending_action",
+                    result=f"Unhandled error: {exc}",
+                )
+            except AuditError:
+                pass
+            raise
+
+        try:
+            self.action_audit_store.record(
+                action,
+                status="confirmed",
+                requested_by="confirm_pending_action",
+                result=result,
+            )
+        except AuditError:
+            pass
+        return result
+
+    def _execute_pending_action(self, action: PendingAction) -> str:
         """Execute a confirmed pending action."""
         if action.kind == "task_delete":
             task_number = int(action.target)

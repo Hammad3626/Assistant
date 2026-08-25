@@ -35,7 +35,13 @@ class ActionTests(unittest.TestCase):
         self.assertTrue(action.target.lower().endswith("chrome.exe"))
 
     def test_parse_allowed_folder_action(self) -> None:
-        action = parse_action("open downloads")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloads_dir = Path(temp_dir) / "Downloads"
+            downloads_dir.mkdir()
+            folders_path = Path(temp_dir) / "folders.json"
+            save_allowed_folders({"downloads": str(downloads_dir)}, folders_path)
+
+            action = parse_action("open downloads", folders_path=folders_path)
 
         self.assertIsNotNone(action)
         assert action is not None
@@ -212,7 +218,7 @@ class ActionTests(unittest.TestCase):
         self.assertIn("Done", result)
 
     @patch("assistant.actions.subprocess.Popen")
-    @patch("assistant.actions.os.startfile", side_effect=OSError("Not a file"))
+    @patch("assistant.actions.os.startfile", create=True, side_effect=OSError("Not a file"))
     def test_try_open_unrestricted_app_fallback(self, mock_startfile, mock_popen) -> None:
         """Test opening an app when startfile fails."""
         from assistant.actions import try_open_unrestricted

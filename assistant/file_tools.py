@@ -555,7 +555,32 @@ class AllowlistedFileTools:
                 updated_text = original_text.replace(clean_old, clean_new)
                 live_path.write_text(updated_text, encoding="utf-8")
             except OSError as exc:
-                raise FileToolError(f"Failed applying change to: {relative_path}") from exc
+                # Don't leave the folder in a partially-changed state that
+                # rollback_bulk_replace_commit() can't help with (it only
+                # works once apply_enabled is set, which only happens after
+                # a full success). Best-effort restore whatever this
+                # attempt already changed, from the same backup, before
+                # raising.
+                restore_errors: list[str] = []
+                for already_changed_relative_path in changed_files:
+                    backup_file_path = backup_dir / "files" / already_changed_relative_path
+                    restore_target = self._resolve_file(root, already_changed_relative_path)
+                    try:
+                        shutil.copy2(backup_file_path, restore_target)
+                    except OSError:
+                        restore_errors.append(already_changed_relative_path)
+                if restore_errors:
+                    raise FileToolError(
+                        f"Failed applying change to: {relative_path}. Additionally, "
+                        f"could not auto-restore already-changed file(s): {', '.join(restore_errors)}. "
+                        "Run 'rollback bulk replace' or restore manually from the backup at "
+                        f"{backup_dir}."
+                    ) from exc
+                raise FileToolError(
+                    f"Failed applying change to: {relative_path}. Already-changed file(s) in "
+                    f"this attempt were automatically restored to their original state; "
+                    "nothing was left partially applied."
+                ) from exc
             changed_files.append(relative_path)
 
         backup_manifest["apply_enabled"] = True
